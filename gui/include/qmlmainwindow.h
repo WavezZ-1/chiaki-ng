@@ -53,6 +53,21 @@ class QFrame;
 class StatsOverlayWidget;
 class BufferedPlaybackPacerThread;
 class DeferredPresentPacerThread;
+class FrameGenPacerThread;
+
+// Snapshot of the frame generation state for the control window.
+struct FrameGenerationInfo
+{
+    int mode = 0;                // 0 off, 1 = 60 fps, 2 = 120 fps, 3 = display rate
+    double display_hz = 60.0;
+    double target_hz = 0.0;      // output rate in display-rate modes (0 in 60 fps mode)
+    bool direct_mapping = true;  // display-rate modes need direct frame mapping
+    bool paced = false;          // display-rate mode is in effect
+    bool created = false;
+    bool supported = true;
+    quint64 video_presents = 0;  // video frames rendered so far
+    FrameGeneratorStats stats;
+};
 class DeferredSwapThread;
 
 class QmlMainWindow : public QWindow
@@ -137,6 +152,8 @@ public:
     // predicted replacement (see FrameGenerator).
     bool applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src, double pts,
                               pl_tex *out_tex, struct pl_frame *out);
+    FrameGenerationInfo frameGenerationInfo() const;
+    void requestFrameGenerationRender();
     QString describePlaceboDiscardReason(qint64 now_us) const;
 
     bool amdCard() const;
@@ -307,7 +324,15 @@ private:
     QAtomicInteger<int> direct_frame_reset = 0;
     // Frame generation (render thread only, except the atomics)
     std::atomic<FrameGenerator *> frame_generator{nullptr};
-    QAtomicInteger<int> frame_generation_enabled = 0;
+    QAtomicInteger<int> frame_generation_mode = 0;
+    std::atomic<float> fg_max_prediction{0.9f};
+    std::atomic<float> fg_threshold{2.0f};
+    QAtomicInteger<int> fg_marker = 0;
+    std::atomic<double> fg_display_hz{60.0};
+    QAtomicInteger<quint64> fg_video_presents = 0;
+    FrameGenPacerThread *fg_pace_thread = nullptr;
+    qint64 fg_unique_shown_us = 0; // render thread: when the newest real frame was shown
+    float fg_last_factor = 0.0f;
     bool frame_generation_was_enabled = false;
     std::array<pl_tex, PL_MAX_PLANES> fg_direct_tex{};
     std::array<std::array<pl_tex, PL_MAX_PLANES>, 4> fg_fallback_tex{};
@@ -321,6 +346,12 @@ private:
     uint64_t fg_last_analysis_ns = 0;
     void destroyFrameGenerator(pl_gpu gpu);
     void updateFrameGenerationStatus();
+    void loadFrameGenerationSettings();
+    void updateFrameGenerationDisplayRate();
+    double frameGenerationTargetHz(int mode) const;
+    FrameGenerator *ensureFrameGenerator(pl_gpu gpu);
+    void handleDirectFrameGeneration(bool new_mapping, qint64 now_us);
+    void armFrameGenPacer(qint64 now_us);
     uint64_t ts_start = 0;
     double queue_pts_origin = -1.0;
     double newest_queued_frame_pts = -1.0;

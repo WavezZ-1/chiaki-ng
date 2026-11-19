@@ -989,18 +989,73 @@ void QmlSettings::setDirectFrameMapping(bool enabled)
     emit directFrameMappingChanged();
 }
 
-bool QmlSettings::frameGeneration() const
+int QmlSettings::frameGenerationMode() const
 {
-    return settings->GetFrameGeneration();
+    return settings->GetFrameGenerationMode();
 }
 
-void QmlSettings::setFrameGeneration(bool enabled)
+void QmlSettings::setFrameGenerationMode(int mode)
 {
-    if (enabled == settings->GetFrameGeneration())
+    if (mode == settings->GetFrameGenerationMode())
         return;
-    settings->SetFrameGeneration(enabled);
+    settings->SetFrameGenerationMode(mode);
     emit frameGenerationChanged();
     emit placeboChanged();
+}
+
+int QmlSettings::frameGenerationMaxPrediction() const
+{
+    return settings->GetFrameGenerationMaxPrediction();
+}
+
+void QmlSettings::setFrameGenerationMaxPrediction(int percent)
+{
+    if (percent == settings->GetFrameGenerationMaxPrediction())
+        return;
+    settings->SetFrameGenerationMaxPrediction(percent);
+    emit frameGenerationChanged();
+    emit placeboChanged();
+}
+
+int QmlSettings::frameGenerationThreshold() const
+{
+    return settings->GetFrameGenerationThreshold();
+}
+
+void QmlSettings::setFrameGenerationThreshold(int tenths)
+{
+    if (tenths == settings->GetFrameGenerationThreshold())
+        return;
+    settings->SetFrameGenerationThreshold(tenths);
+    emit frameGenerationChanged();
+    emit placeboChanged();
+}
+
+bool QmlSettings::frameGenerationMarker() const
+{
+    return settings->GetFrameGenerationMarker();
+}
+
+void QmlSettings::setFrameGenerationMarker(bool enabled)
+{
+    if (enabled == settings->GetFrameGenerationMarker())
+        return;
+    settings->SetFrameGenerationMarker(enabled);
+    emit frameGenerationChanged();
+    emit placeboChanged();
+}
+
+bool QmlSettings::frameGenerationControlWindow() const
+{
+    return settings->GetFrameGenerationControlWindow();
+}
+
+void QmlSettings::setFrameGenerationControlWindow(bool enabled)
+{
+    if (enabled == settings->GetFrameGenerationControlWindow())
+        return;
+    settings->SetFrameGenerationControlWindow(enabled);
+    emit frameGenerationChanged();
 }
 
 void QmlSettings::setPlaceboFrameMixer(int mixer)

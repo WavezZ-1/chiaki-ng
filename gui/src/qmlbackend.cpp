@@ -1,6 +1,7 @@
 #include "qmlbackend.h"
 #include "qmlsettings.h"
 #include "qmlmainwindow.h"
+#include "framegencontrol.h"
 #include "streamsession.h"
 #include "controllermanager.h"
 #include "psnaccountid.h"
@@ -339,6 +340,8 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
     connect(settings_qml, &QmlSettings::allowJoystickBackgroundEventsChanged, this, &QmlBackend::setAllowJoystickBackgroundEvents);
     connect(window, &QmlMainWindow::activeChanged, this, &QmlBackend::setIsAppActive);
     connect(this, &QmlBackend::sessionChanged, this, &QmlBackend::setIsAppActive);
+    connect(this, &QmlBackend::sessionChanged, this, &QmlBackend::updateFrameGenerationControl);
+    connect(settings_qml, &QmlSettings::frameGenerationChanged, this, &QmlBackend::updateFrameGenerationControl);
     setAllowJoystickBackgroundEvents();
     setIsAppActive();
     ControllerManager::GetInstance()->SetIsAppActive(window->isActive());
@@ -504,8 +507,39 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_
     return frame_has_planes(frame.frame);
 }
 
+void QmlBackend::showFrameGenerationControl()
+{
+    if (!framegen_control)
+        framegen_control = new FrameGenControlWindow(settings_qml, window);
+    framegen_control_auto_shown = false;
+    framegen_control->show();
+    framegen_control->raise();
+}
+
+// Shows the frame generation control window while a stream is running (if
+// enabled in the settings) and hides it again afterwards. A window opened by
+// hand from the settings stays open.
+void QmlBackend::updateFrameGenerationControl()
+{
+    const bool streaming = session != nullptr;
+    const bool wanted = streaming && settings->GetFrameGenerationControlWindow();
+    if (wanted) {
+        if (!framegen_control)
+            framegen_control = new FrameGenControlWindow(settings_qml, window);
+        if (!framegen_control->isVisible()) {
+            framegen_control_auto_shown = true;
+            framegen_control->show();
+        }
+    } else if (framegen_control && framegen_control_auto_shown && framegen_control->isVisible()) {
+        framegen_control->hide();
+        framegen_control_auto_shown = false;
+    }
+}
+
 QmlBackend::~QmlBackend()
 {
+    delete framegen_control;
+    framegen_control = nullptr;
     teardownSession();
 #ifdef CHIAKI_HAVE_WEBENGINE
     if(request_interceptor)

@@ -32,11 +32,12 @@ struct FrameGeneratorStats
 	uint64_t frames = 0;        // frames inspected
 	uint64_t unique = 0;        // frames with new content
 	uint64_t duplicates = 0;    // repeated frames detected
-	uint64_t generated = 0;     // repeated frames replaced with predictions
+	uint64_t generated = 0;     // predicted frames produced
 	double cadence = 1.0;       // average stream frames per game frame (2.0 = 30 fps game at 60 fps)
-	bool active = false;        // a low-fps cadence was detected and frames are being generated
+	double frame_interval = 0.0; // average seconds between game frames (0 = unknown)
+	bool active = false;        // a low-fps cadence (repeated frames) was detected
 	float last_metric = 0.0f;   // last frame-difference metric (8-bit luma levels)
-	float process_ms = 0.0f;    // time spent inside process() for the last frame (CPU side, includes the readback wait)
+	float process_ms = 0.0f;    // time spent analysing the last frame (CPU side, includes the readback wait)
 	bool gpu_timers = false;    // GPU timings below are available
 	uint64_t gpu_analysis_ns = 0; // total GPU time of the per-frame analysis passes
 	uint64_t gpu_generate_ns = 0; // total GPU time spent predicting frames
@@ -68,6 +69,28 @@ public:
 	// unchanged.
 	bool process(const struct pl_frame *src, double pts, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out);
 
+	// The two halves of process(), for callers that pace output themselves
+	// (e.g. at the display refresh rate):
+	//
+	// analyze() inspects a freshly mapped frame and updates the history.
+	// `*is_new` tells whether it carries new content or repeats the previous
+	// game frame. Returns false if the frame could not be analysed (show it as
+	// is and do not predict from it).
+	bool analyze(const struct pl_frame *src, double pts, bool *is_new);
+
+	// True once two distinct game frames are known and recent enough to
+	// extrapolate from.
+	bool canPredict() const;
+
+	// Predicts the picture `factor` game frames after the newest real frame
+	// (0 < factor < 1, capped internally). `meta` supplies the frame layout and
+	// colour metadata (the last mapped frame); its textures are not used.
+	bool predict(const struct pl_frame *meta, float factor, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out);
+
+	// Average time between two game frames in seconds (from the pts of new
+	// frames), or 0 if not known yet.
+	double gameFrameInterval() const { return frame_interval; }
+
 	// Forget all history, e.g. after a seek, a reconnect or a format change.
 	void reset();
 
@@ -76,6 +99,9 @@ public:
 	// Frame-difference threshold below which a frame counts as a repeat,
 	// in 8-bit luma levels (mean absolute difference over a 32x32 block).
 	void setDuplicateThreshold(float levels) { dup_threshold_levels = levels; }
+
+	// Draw a small white square in the top-left corner of predicted frames.
+	void setMarker(bool enabled) { show_marker = enabled; }
 
 	// Receives warnings (resource or shader failures). Defaults to stderr.
 	void setLogger(std::function<void(const char *)> fn) { logger = std::move(fn); }
@@ -139,6 +165,7 @@ private:
 	void collectTimers();
 
 	bool readDiffMetric(float *metric);
+	void recordFailure();
 	bool estimateMotion();
 	bool generate(const struct pl_frame *src, float factor, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out);
 
@@ -173,15 +200,18 @@ private:
 	bool have_last_pts = false;
 	int dups_since_unique = 0;
 	double cadence = 1.0;
+	double frame_interval = 0.0;
 	bool motion_pending = false;
 	bool motion_valid = false;
 	float dup_threshold_levels = 2.0f;
+	bool show_marker = false;
 
 	std::atomic<uint64_t> stat_frames{0};
 	std::atomic<uint64_t> stat_unique{0};
 	std::atomic<uint64_t> stat_dups{0};
 	std::atomic<uint64_t> stat_generated{0};
 	std::atomic<double> stat_cadence{1.0};
+	std::atomic<double> stat_interval{0.0};
 	std::atomic<bool> stat_active{false};
 	std::atomic<float> stat_metric{0.0f};
 	std::atomic<float> stat_ms{0.0f};

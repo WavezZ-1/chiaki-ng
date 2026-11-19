@@ -380,6 +380,9 @@ const char *kWarpBody = R"(
 #else
     color = texture(fg_src, suv);
 #endif
+    // Optional marker (top-left square) to make predicted frames visible.
+    if (pc.x < fg_marker.x && pc.y < fg_marker.y)
+        color = vec4(fg_marker.z);
 )";
 
 } // namespace
@@ -485,9 +488,11 @@ void FrameGenerator::resetState()
 	last_pts = 0.0;
 	dups_since_unique = 0;
 	cadence = 1.0;
+	frame_interval = 0.0;
 	motion_pending = false;
 	motion_valid = false;
 	stat_cadence.store(cadence);
+	stat_interval.store(0.0);
 	stat_active.store(false);
 }
 
@@ -504,6 +509,7 @@ FrameGeneratorStats FrameGenerator::stats() const
 	s.duplicates = stat_dups.load();
 	s.generated = stat_generated.load();
 	s.cadence = stat_cadence.load();
+	s.frame_interval = stat_interval.load();
 	s.active = stat_active.load();
 	s.last_metric = stat_metric.load();
 	s.process_ms = stat_ms.load();
@@ -760,9 +766,18 @@ bool FrameGenerator::warpPass(pl_tex src, pl_tex mv, pl_tex dst, float fx, float
 	float size[2] = { static_cast<float>(src->params.w), static_cast<float>(src->params.h) };
 	float scale[2] = { fx, fy };
 	float conf[4] = { kConfAbsLow, kConfAbsHigh, kConfRelLow, kConfRelHigh };
+	// Marker: a 1/24-of-the-height square, white in luma and neutral in chroma.
+	float marker[3] = { 0.0f, 0.0f, 0.0f };
+	if (show_marker) {
+		const float box = std::max(8.0f, layout.h[layout.luma_plane] / 24.0f);
+		marker[0] = box * src->params.w / layout.w[layout.luma_plane];
+		marker[1] = box * src->params.h / layout.h[layout.luma_plane];
+		marker[2] = bicubic ? 0.92f : 0.5f;
+	}
 	return runPass(dispatch, "framegen warp", header, kWarpBody,
 	               { { "fg_src", src, true }, { "fg_mv", mv, true } },
-	               { { pl_var_vec2("fg_size"), size }, { pl_var_vec2("fg_mv_scale"), scale }, { pl_var_vec4("fg_conf"), conf } },
+	               { { pl_var_vec2("fg_size"), size }, { pl_var_vec2("fg_mv_scale"), scale }, { pl_var_vec4("fg_conf"), conf },
+	                 { pl_var_vec3("fg_marker"), marker } },
 	               dst, timers[kTimerWarp + plane]);
 }
 
@@ -878,10 +893,22 @@ bool FrameGenerator::generate(const struct pl_frame *src, float factor, pl_tex o
 	return true;
 }
 
-bool FrameGenerator::process(const struct pl_frame *src, double pts, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out)
+void FrameGenerator::recordFailure()
+{
+	resetState();
+	if (++consecutive_failures >= 3) {
+		warn("GPU passes keep failing, frame generation disabled");
+		disabled = true;
+	} else {
+		warn("GPU pass failed, resetting history");
+	}
+}
+
+bool FrameGenerator::analyze(const struct pl_frame *src, double pts, bool *is_new)
 {
 	const auto t_begin = std::chrono::steady_clock::now();
-	if (!valid() || !src || !out_tex || !out)
+	*is_new = true;
+	if (!valid() || !src)
 		return false;
 	if (src->num_planes <= 0 || src->num_planes > PL_MAX_PLANES)
 		return false;
@@ -929,7 +956,6 @@ bool FrameGenerator::process(const struct pl_frame *src, double pts, pl_tex out_
 		threshold *= dups_since_unique < expected_dups ? 1.5f : 0.75f;
 	const bool is_dup = ok && have_cur && levels < threshold;
 
-	bool generated = false;
 	if (ok && !is_dup) {
 		for (int i = 0; ok && i < layout.num_planes; i++)
 			ok = copyPass(frame.planes[i].texture, in.planes[i], i);
@@ -941,6 +967,9 @@ bool FrameGenerator::process(const struct pl_frame *src, double pts, pl_tex out_
 			if (have_cur) {
 				const int interval = dups_since_unique + 1;
 				cadence = std::min(8.0, std::max(1.0, cadence * 0.85 + interval * 0.15));
+				const double dt = pts - history[cur_slot].pts;
+				if (dt > 0.0 && dt < kMaxMotionAge)
+					frame_interval = frame_interval > 0.0 ? frame_interval * 0.8 + dt * 0.2 : dt;
 			}
 			const int old_prev = prev_slot;
 			prev_slot = have_cur ? cur_slot : -1;
@@ -964,43 +993,71 @@ bool FrameGenerator::process(const struct pl_frame *src, double pts, pl_tex out_
 	} else if (ok) {
 		dups_since_unique++;
 		stat_dups.fetch_add(1);
-		if (cadence_locked && prev_slot >= 0 && dups_since_unique <= expected_dups && (motion_pending || motion_valid)) {
-			if (motion_pending) {
-				motion_valid = estimateMotion();
-				motion_pending = false;
-			}
-			if (motion_valid) {
-				const float factor = std::min(kMaxFactor, static_cast<float>(dups_since_unique / cadence));
-				generated = generate(src, factor, out_tex, out);
-				ok = generated;
-			}
-		}
 	}
 
 	if (frame.release)
 		frame.release(gpu, &frame);
 
 	if (!ok) {
-		resetState();
-		if (++consecutive_failures >= 3) {
-			warn("GPU passes keep failing, frame generation disabled");
-			disabled = true;
-		} else {
-			warn("GPU pass failed, resetting history");
-		}
+		recordFailure();
 		return false;
 	}
 	consecutive_failures = 0;
 
+	*is_new = !is_dup;
 	last_pts = pts;
 	have_last_pts = true;
 	if (have_cur)
 		stat_metric.store(levels);
 	stat_cadence.store(cadence);
+	stat_interval.store(frame_interval);
 	stat_active.store(cadence >= kMinCadence && cadence <= kMaxCadence);
-	if (generated)
-		stat_generated.fetch_add(1);
 	const auto t_end = std::chrono::steady_clock::now();
 	stat_ms.store(std::chrono::duration<float, std::milli>(t_end - t_begin).count());
-	return generated;
+	return true;
+}
+
+bool FrameGenerator::canPredict() const
+{
+	return valid() && cur_slot >= 0 && prev_slot >= 0 && history[cur_slot].valid && history[prev_slot].valid
+	       && (motion_pending || motion_valid);
+}
+
+bool FrameGenerator::predict(const struct pl_frame *meta, float factor, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out)
+{
+	if (!meta || !out_tex || !out || !canPredict())
+		return false;
+	if (meta->num_planes != layout.num_planes)
+		return false;
+	if (motion_pending) {
+		motion_valid = estimateMotion();
+		motion_pending = false;
+		if (!motion_valid) {
+			recordFailure();
+			return false;
+		}
+	}
+	if (!motion_valid)
+		return false;
+	factor = std::min(kMaxFactor, std::max(0.0f, factor));
+	if (!generate(meta, factor, out_tex, out)) {
+		recordFailure();
+		return false;
+	}
+	stat_generated.fetch_add(1);
+	return true;
+}
+
+bool FrameGenerator::process(const struct pl_frame *src, double pts, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out)
+{
+	if (!out_tex || !out)
+		return false;
+	bool is_new = true;
+	if (!analyze(src, pts, &is_new) || is_new)
+		return false;
+	const bool cadence_locked = cadence >= kMinCadence && cadence <= kMaxCadence;
+	const int expected_dups = std::max(1, static_cast<int>(std::lround(cadence)) - 1);
+	if (!cadence_locked || dups_since_unique > expected_dups)
+		return false;
+	return predict(src, static_cast<float>(dups_since_unique / cadence), out_tex, out);
 }

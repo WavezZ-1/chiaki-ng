@@ -520,8 +520,20 @@ class Settings : public QObject
 		PlaceboFrameMixer GetPlaceboFrameMixer() const;
 		bool GetDirectFrameMapping() const { return settings.value("settings/direct_frame_mapping", true).toBool(); }
 		void SetDirectFrameMapping(bool enabled) { settings.setValue("settings/direct_frame_mapping", enabled); }
-		bool GetFrameGeneration() const { return settings.value("settings/frame_generation", false).toBool(); }
-		void SetFrameGeneration(bool enabled) { settings.setValue("settings/frame_generation", enabled); }
+		// Frame generation: 0 = off, 1 = 60 fps (replace repeated frames),
+		// 2 = up to 120 fps, 3 = up to the display refresh rate
+		int GetFrameGenerationMode() const { return qBound(0, settings.value("settings/frame_generation_mode", 0).toInt(), 3); }
+		void SetFrameGenerationMode(int mode) { settings.setValue("settings/frame_generation_mode", qBound(0, mode, 3)); }
+		// How far ahead predictions may reach, in percent of a game frame (50..95)
+		int GetFrameGenerationMaxPrediction() const { return qBound(50, settings.value("settings/frame_generation_max_prediction", 90).toInt(), 95); }
+		void SetFrameGenerationMaxPrediction(int percent) { settings.setValue("settings/frame_generation_max_prediction", qBound(50, percent, 95)); }
+		// Repeated-frame threshold in tenths of 8-bit luma levels (5..60)
+		int GetFrameGenerationThreshold() const { return qBound(5, settings.value("settings/frame_generation_threshold", 20).toInt(), 60); }
+		void SetFrameGenerationThreshold(int tenths) { settings.setValue("settings/frame_generation_threshold", qBound(5, tenths, 60)); }
+		bool GetFrameGenerationMarker() const { return settings.value("settings/frame_generation_marker", false).toBool(); }
+		void SetFrameGenerationMarker(bool enabled) { settings.setValue("settings/frame_generation_marker", enabled); }
+		bool GetFrameGenerationControlWindow() const { return settings.value("settings/frame_generation_control_window", true).toBool(); }
+		void SetFrameGenerationControlWindow(bool enabled) { settings.setValue("settings/frame_generation_control_window", enabled); }
 		void SetPlaceboFrameMixer(PlaceboFrameMixer frame_mixer);
 
 		bool GetPlaceboDeinterlaceEnabled() const;

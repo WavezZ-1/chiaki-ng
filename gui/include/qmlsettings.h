@@ -100,7 +100,11 @@ class QmlSettings : public QObject
 	Q_PROPERTY(int placeboPlaneDownscaler READ placeboPlaneDownscaler WRITE setPlaceboPlaneDownscaler NOTIFY placeboPlaneDownscalerChanged)
 	Q_PROPERTY(int placeboFrameMixer READ placeboFrameMixer WRITE setPlaceboFrameMixer NOTIFY placeboFrameMixerChanged)
 	Q_PROPERTY(bool directFrameMapping READ directFrameMapping WRITE setDirectFrameMapping NOTIFY directFrameMappingChanged)
-	Q_PROPERTY(bool frameGeneration READ frameGeneration WRITE setFrameGeneration NOTIFY frameGenerationChanged)
+	Q_PROPERTY(int frameGenerationMode READ frameGenerationMode WRITE setFrameGenerationMode NOTIFY frameGenerationChanged)
+	Q_PROPERTY(int frameGenerationMaxPrediction READ frameGenerationMaxPrediction WRITE setFrameGenerationMaxPrediction NOTIFY frameGenerationChanged)
+	Q_PROPERTY(int frameGenerationThreshold READ frameGenerationThreshold WRITE setFrameGenerationThreshold NOTIFY frameGenerationChanged)
+	Q_PROPERTY(bool frameGenerationMarker READ frameGenerationMarker WRITE setFrameGenerationMarker NOTIFY frameGenerationChanged)
+	Q_PROPERTY(bool frameGenerationControlWindow READ frameGenerationControlWindow WRITE setFrameGenerationControlWindow NOTIFY frameGenerationChanged)
 	Q_PROPERTY(bool placeboDeinterlaceEnabled READ placeboDeinterlaceEnabled WRITE setPlaceboDeinterlaceEnabled NOTIFY placeboDeinterlaceEnabledChanged)
 	Q_PROPERTY(int placeboDeinterlacePreset READ placeboDeinterlacePreset WRITE setPlaceboDeinterlacePreset NOTIFY placeboDeinterlacePresetChanged)
 	Q_PROPERTY(int placeboDeinterlaceAlgorithm READ placeboDeinterlaceAlgorithm WRITE setPlaceboDeinterlaceAlgorithm NOTIFY placeboDeinterlaceAlgorithmChanged)
@@ -348,8 +352,16 @@ public:
     int placeboFrameMixer() const;
     bool directFrameMapping() const;
     void setDirectFrameMapping(bool enabled);
-    bool frameGeneration() const;
-    void setFrameGeneration(bool enabled);
+    int frameGenerationMode() const;
+    void setFrameGenerationMode(int mode);
+    int frameGenerationMaxPrediction() const;
+    void setFrameGenerationMaxPrediction(int percent);
+    int frameGenerationThreshold() const;
+    void setFrameGenerationThreshold(int tenths);
+    bool frameGenerationMarker() const;
+    void setFrameGenerationMarker(bool enabled);
+    bool frameGenerationControlWindow() const;
+    void setFrameGenerationControlWindow(bool enabled);
     void setPlaceboFrameMixer(int mixer);
 
     bool placeboDeinterlaceEnabled() const;

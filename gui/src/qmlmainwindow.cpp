@@ -385,6 +385,88 @@ private:
     quint64 generation = 0;
 };
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <mmsystem.h>
+#endif
+
+// Wakes the renderer at display-refresh ticks between two real video frames so
+// that frame generation can show its predictions at the full display rate.
+class FrameGenPacerThread final : public QThread
+{
+public:
+    explicit FrameGenPacerThread(QmlMainWindow *owner) : owner(owner) {}
+
+    // Replaces any pending wake-up with `target_wakeup_us`.
+    void arm(qint64 target_wakeup_us)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (stopping)
+            return;
+        wakeup_target_us = target_wakeup_us;
+        armed = true;
+        ++generation;
+        condition.notify_one();
+    }
+
+    void stopThread()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stopping = true;
+        armed = false;
+        ++generation;
+        condition.notify_one();
+    }
+
+protected:
+    void run() override
+    {
+#ifdef Q_OS_WIN
+        // Ticks are only a few milliseconds apart; the default Windows timer
+        // granularity (15.6 ms) would make them fire far too late.
+        timeBeginPeriod(1);
+#endif
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!stopping) {
+            if (!armed) {
+                condition.wait(lock);
+                continue;
+            }
+            const qint64 target = wakeup_target_us;
+            const quint64 observed_generation = generation;
+            const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+            if (target > now_us) {
+                condition.wait_for(lock, std::chrono::microseconds(target - now_us),
+                    [this, observed_generation]() { return stopping || generation != observed_generation; });
+                if (stopping)
+                    break;
+                if (generation != observed_generation)
+                    continue;
+            }
+            armed = false;
+            lock.unlock();
+            if (owner) {
+                QMetaObject::invokeMethod(owner, [owner = this->owner]() {
+                    owner->requestFrameGenerationRender();
+                }, Qt::QueuedConnection);
+            }
+            lock.lock();
+        }
+#ifdef Q_OS_WIN
+        timeEndPeriod(1);
+#endif
+    }
+
+private:
+    QmlMainWindow *owner = nullptr;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool stopping = false;
+    bool armed = false;
+    qint64 wakeup_target_us = 0;
+    quint64 generation = 0;
+};
+
 class BufferedPlaybackPacerThread final : public QThread
 {
 public:
@@ -2588,6 +2670,12 @@ QmlMainWindow::~QmlMainWindow()
         delete buffered_pace_thread;
         buffered_pace_thread = nullptr;
     }
+    if (fg_pace_thread) {
+        fg_pace_thread->stopThread();
+        fg_pace_thread->wait();
+        delete fg_pace_thread;
+        fg_pace_thread = nullptr;
+    }
     if (present_pace_thread) {
         present_pace_thread->stopThread();
         present_pace_thread->wait();
@@ -2890,7 +2978,7 @@ void QmlMainWindow::setVideoPreset(VideoPreset preset)
 void QmlMainWindow::setSettings(Settings *new_settings)
 {
     settings = new_settings;
-    frame_generation_enabled.storeRelease(settings && settings->GetFrameGeneration() ? 1 : 0);
+    loadFrameGenerationSettings();
     QString profile = settings->GetCurrentProfile();
     qCCritical(chiakiGui) << "Current Profile: " << profile;
     if(profile.isEmpty())
@@ -4848,7 +4936,10 @@ void QmlMainWindow::doneOpenGLContextCurrent()
 void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
 {
     bypass_frame_queue = settings->GetDirectFrameMapping();
-    frame_generation_enabled.storeRelease(settings->GetFrameGeneration() ? 1 : 0);
+    frame_generation_mode.storeRelease(settings->GetFrameGenerationMode());
+    fg_max_prediction.store(settings->GetFrameGenerationMaxPrediction() / 100.0f);
+    fg_threshold.store(settings->GetFrameGenerationThreshold() / 10.0f);
+    fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     render_backend = settings->GetRenderBackend();
     setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
     qparams = {};
@@ -5159,6 +5250,9 @@ renderer_backend_ready:
 
     present_pace_thread = new DeferredPresentPacerThread(this);
     present_pace_thread->start();
+
+    fg_pace_thread = new FrameGenPacerThread(this);
+    fg_pace_thread->start();
 
     vulkan_deferred_swap_enabled = settings->GetVulkanDeferredSwap();
     deferred_swap_thread = new DeferredSwapThread(this);
@@ -5885,20 +5979,51 @@ void QmlMainWindow::drainDeferredSwaps()
 void QmlMainWindow::updatePlacebo()
 {
     renderparams_changed = true;
-    frame_generation_enabled.storeRelease(settings && settings->GetFrameGeneration() ? 1 : 0);
+    loadFrameGenerationSettings();
     schedule_frame_mixer_active.storeRelaxed(configuredFrameMixerEnabledForScheduling() ? 1 : 0);
 }
 
-bool QmlMainWindow::applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src, double pts,
-                                         pl_tex *out_tex, struct pl_frame *out)
+void QmlMainWindow::loadFrameGenerationSettings()
 {
-    const bool enabled = frame_generation_enabled.loadAcquire() != 0;
+    if (!settings)
+        return;
+    frame_generation_mode.storeRelease(settings->GetFrameGenerationMode());
+    fg_max_prediction.store(settings->GetFrameGenerationMaxPrediction() / 100.0f);
+    fg_threshold.store(settings->GetFrameGenerationThreshold() / 10.0f);
+    fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
+    updateFrameGenerationDisplayRate();
+}
+
+void QmlMainWindow::updateFrameGenerationDisplayRate()
+{
+    double hz = screen() ? screen()->refreshRate() : 60.0;
+    if (hz <= 1.0)
+        hz = 60.0;
+    fg_display_hz.store(hz);
+}
+
+double QmlMainWindow::frameGenerationTargetHz(int mode) const
+{
+    const double display_hz = fg_display_hz.load();
+    switch (mode) {
+    case 2:
+        return qMin(120.0, display_hz);
+    case 3:
+        return display_hz;
+    default:
+        return 0.0;
+    }
+}
+
+FrameGenerator *QmlMainWindow::ensureFrameGenerator(pl_gpu gpu)
+{
     FrameGenerator *fg = frame_generator.load();
-    if (!enabled) {
+    if (frame_generation_mode.loadAcquire() == 0) {
         if (frame_generation_was_enabled && fg)
             fg->reset();
         frame_generation_was_enabled = false;
-        return false;
+        fg_unique_shown_us = 0;
+        return nullptr;
     }
     if (!frame_generation_was_enabled && fg)
         fg->reset();
@@ -5916,12 +6041,113 @@ bool QmlMainWindow::applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src,
         frame_generator.store(fg);
     }
     if (!fg->valid())
+        return nullptr;
+    fg->setDuplicateThreshold(fg_threshold.load());
+    fg->setMarker(fg_marker.loadAcquire() != 0);
+    return fg;
+}
+
+bool QmlMainWindow::applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src, double pts,
+                                         pl_tex *out_tex, struct pl_frame *out)
+{
+    FrameGenerator *fg = ensureFrameGenerator(gpu);
+    if (!fg)
         return false;
     if (!out_tex) {
         out_tex = fg_fallback_tex[fg_fallback_index % fg_fallback_tex.size()].data();
         fg_fallback_index++;
     }
     return fg->process(src, pts, out_tex, out);
+}
+
+void QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
+{
+    pl_gpu gpu = placeboGpu();
+    const double target_hz = frameGenerationTargetHz(frame_generation_mode.loadAcquire());
+    if (target_hz <= 61.0) {
+        // 60 fps mode: only repeated stream frames are replaced.
+        fg_unique_shown_us = 0;
+        if (new_mapping) {
+            fg_direct_frame_valid = applyFrameGeneration(gpu, &direct_frame, static_cast<double>(now_us) / 1e6,
+                                                         fg_direct_tex.data(), &fg_direct_frame);
+        }
+        return;
+    }
+
+    // Display-rate mode: every render shows the newest real frame or a
+    // prediction for the current time. Direct mapping never re-submits a
+    // frame, so the arrival time serves as pts.
+    FrameGenerator *fg = ensureFrameGenerator(gpu);
+    if (!fg) {
+        fg_direct_frame_valid = false;
+        return;
+    }
+    if (new_mapping) {
+        bool is_new = true;
+        if (!fg->analyze(&direct_frame, static_cast<double>(now_us) / 1e6, &is_new) || is_new) {
+            fg_unique_shown_us = now_us;
+            fg_direct_frame_valid = false;
+            fg_last_factor = 0.0f;
+            armFrameGenPacer(now_us);
+            return;
+        }
+    }
+    const double interval = fg->gameFrameInterval();
+    if (fg_unique_shown_us <= 0 || interval <= 0.0 || !fg->canPredict())
+        return;
+    const double factor = static_cast<double>(now_us - fg_unique_shown_us) / 1e6 / interval;
+    const float max_factor = fg_max_prediction.load();
+    if (factor < 0.04) {
+        fg_direct_frame_valid = false;
+    } else if (factor < 2.0) {
+        const float target = static_cast<float>(qMin<double>(factor, max_factor));
+        // Once the cap is reached the picture holds until the next real frame.
+        if (!fg_direct_frame_valid || qAbs(target - fg_last_factor) > 1e-4f) {
+            fg_direct_frame_valid = fg->predict(&direct_frame, target, fg_direct_tex.data(), &fg_direct_frame);
+            fg_last_factor = fg_direct_frame_valid ? target : 0.0f;
+        }
+    }
+    armFrameGenPacer(now_us);
+}
+
+void QmlMainWindow::armFrameGenPacer(qint64 now_us)
+{
+    FrameGenerator *fg = frame_generator.load();
+    const double target_hz = frameGenerationTargetHz(frame_generation_mode.loadAcquire());
+    if (!fg_pace_thread || !fg || fg_unique_shown_us <= 0 || target_hz <= 61.0)
+        return;
+    const double interval = fg->gameFrameInterval();
+    if (interval <= 0.0)
+        return;
+    // Refresh ticks are aligned to the moment the newest real frame was shown.
+    const double tick_us = 1e6 / target_hz;
+    const double elapsed_us = static_cast<double>(now_us - fg_unique_shown_us);
+    const double next_rel_us = (std::floor(elapsed_us / tick_us) + 1.0) * tick_us;
+    if (next_rel_us / 1e6 / interval > fg_max_prediction.load() + 1e-3)
+        return; // nothing new to show before the next real frame
+    fg_pace_thread->arm(fg_unique_shown_us + static_cast<qint64>(next_rel_us));
+}
+
+void QmlMainWindow::requestFrameGenerationRender()
+{
+    scheduleUpdate(false, UpdateRequestReason::Timer);
+}
+
+FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
+{
+    FrameGenerationInfo info;
+    info.mode = frame_generation_mode.loadAcquire();
+    info.display_hz = fg_display_hz.load();
+    info.target_hz = frameGenerationTargetHz(info.mode);
+    info.direct_mapping = bypass_frame_queue;
+    info.paced = bypass_frame_queue && info.target_hz > 61.0;
+    info.video_presents = fg_video_presents.loadRelaxed();
+    FrameGenerator *fg = frame_generator.load();
+    info.created = fg != nullptr;
+    info.supported = !fg || fg->valid();
+    if (fg)
+        info.stats = fg->stats();
+    return info;
 }
 
 void QmlMainWindow::destroyFrameGenerator(pl_gpu gpu)
@@ -5939,9 +6165,10 @@ void QmlMainWindow::destroyFrameGenerator(pl_gpu gpu)
 
 void QmlMainWindow::updateFrameGenerationStatus()
 {
+    updateFrameGenerationDisplayRate();
     QString status;
     FrameGenerator *fg = frame_generator.load();
-    if (frame_generation_enabled.loadAcquire() == 0) {
+    if (frame_generation_mode.loadAcquire() == 0) {
         status = tr("off");
     } else if (!fg) {
         status = tr("waiting");
@@ -5957,9 +6184,9 @@ void QmlMainWindow::updateFrameGenerationStatus()
         fg_last_frames = st.frames;
         fg_last_generate_ns = st.gpu_generate_ns;
         fg_last_analysis_ns = st.gpu_analysis_ns;
-        if (!st.active) {
-            status = tr("idle (no 30 fps cadence)");
-        } else if (st.gpu_timers && generated_now > 0) {
+        if (generated_now == 0) {
+            status = tr("idle");
+        } else if (st.gpu_timers) {
             // GPU cost of one predicted frame, including the per-frame analysis
             const double ms = (static_cast<double>(generate_ns) / generated_now
                                + (frames_now ? static_cast<double>(analysis_ns) / frames_now : 0.0)) / 1e6;
@@ -6886,6 +7113,7 @@ void QmlMainWindow::render()
     if (bypass_frame_queue) {
         AVFrame *incoming = nullptr;
         bool reset_direct_frame = false;
+        bool direct_frame_mapped_now = false;
         {
             QMutexLocker locker(&direct_frame_mutex);
             std::swap(incoming, direct_pending_frame);
@@ -6910,13 +7138,14 @@ void QmlMainWindow::render()
                 if (backend && backend->zeroCopy())
                     backend->disableZeroCopy();
             } else if (direct_frame.num_planes > 0) {
-                // Direct mapping never re-submits a frame, so arrival time works as pts.
-                const double arrival_s = static_cast<double>(chiaki_time_now_monotonic_us()) / 1000000.0;
-                fg_direct_frame_valid = applyFrameGeneration(placeboGpu(), &direct_frame, arrival_s,
-                                                             fg_direct_tex.data(), &fg_direct_frame);
+                direct_frame_mapped_now = true;
             }
             av_frame_free(&incoming);
         }
+        if (direct_frame.num_planes > 0)
+            handleDirectFrameGeneration(direct_frame_mapped_now, static_cast<qint64>(chiaki_time_now_monotonic_us()));
+        else
+            fg_direct_frame_valid = false;
         direct_render_frame = fg_direct_frame_valid ? fg_direct_frame : direct_frame;
         frame_mix = {};
         frame_mix.num_frames = direct_frame.num_planes > 0 ? 1 : 0;
@@ -7732,6 +7961,8 @@ void QmlMainWindow::render()
         schedulePostSwapchainRecreateRefresh();
         return;
     }
+    if (bypass_frame_queue ? direct_render_frame.num_planes > 0 : frame_mix.num_frames > 0)
+        fg_video_presents.fetchAndAddRelaxed(1);
     {
         const qint64 render_after_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         if (render_after_us >= render_call_begin_us) {

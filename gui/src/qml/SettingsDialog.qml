@@ -998,15 +998,39 @@ DialogView {
                         text: qsTr("Frame Generation:")
                     }
 
-                    C.CheckBox {
-                        text: qsTr("30 → 60 fps: replace repeated frames with predicted ones (stream at 60 fps)")
-                        checked: Chiaki.settings.frameGeneration
-                        onToggled: Chiaki.settings.frameGeneration = checked
+                    C.ComboBox {
+                        Layout.preferredWidth: 400
+                        model: [qsTr("Off"), qsTr("60 fps (replace repeated frames)"), qsTr("Up to 120 fps"), qsTr("Display refresh rate")]
+                        currentIndex: Chiaki.settings.frameGenerationMode
+                        onActivated: (index) => Chiaki.settings.frameGenerationMode = index
                     }
 
                     Label {
                         Layout.alignment: Qt.AlignRight
-                        text: qsTr("(Unchecked)")
+                        text: qsTr("(Off)")
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        text: qsTr("Frame Generation Panel:")
+                    }
+
+                    RowLayout {
+                        C.CheckBox {
+                            text: qsTr("Show while streaming")
+                            checked: Chiaki.settings.frameGenerationControlWindow
+                            onToggled: Chiaki.settings.frameGenerationControlWindow = checked
+                        }
+
+                        C.Button {
+                            text: qsTr("Open now")
+                            onClicked: Chiaki.showFrameGenerationControl()
+                        }
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        text: qsTr("(Checked)")
                     }
 
                     Label {

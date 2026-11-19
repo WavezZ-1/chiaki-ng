@@ -21,6 +21,7 @@
 #endif
 
 class SystemdInhibit;
+class FrameGenControlWindow;
 #ifdef Q_OS_MACOS
     class MacWakeSleep;
 #elif defined(Q_OS_WINDOWS)
@@ -182,6 +183,7 @@ public:
     void enableZeroCopy()  { disable_zero_copy = false; };
 
     Q_INVOKABLE void deleteHost(int index);
+    Q_INVOKABLE void showFrameGenerationControl();
     Q_INVOKABLE void wakeUpHost(int index, QString nickname = QString());
     Q_INVOKABLE void addManualHost(int index, const QString &address);
     Q_INVOKABLE void hideHost(const QString &mac_string, const QString &host_nickname);
@@ -286,6 +288,9 @@ private:
     Settings *settings = {};
     QmlSettings *settings_qml = {};
     QmlMainWindow *window = {};
+    FrameGenControlWindow *framegen_control = {};
+    bool framegen_control_auto_shown = false;
+    void updateFrameGenerationControl();
     StreamSession *session = {};
     QThread *frame_thread = {};
     QTimer *psn_reconnect_timer = {};
