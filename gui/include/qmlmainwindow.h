@@ -331,7 +331,7 @@ private:
     QAtomicInteger<int> frame_generation_mode = 0;
     std::atomic<float> fg_max_prediction{0.9f};
     std::atomic<float> fg_threshold{2.0f};
-    std::atomic<float> fg_damping{0.7f};
+    std::atomic<float> fg_damping{1.0f};
     QAtomicInteger<int> fg_marker = 0;
     std::atomic<double> fg_display_hz{60.0};
     QAtomicInteger<quint64> fg_video_presents = 0;

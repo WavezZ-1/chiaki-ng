@@ -530,9 +530,9 @@ class Settings : public QObject
 		// Repeated-frame threshold in tenths of 8-bit luma levels (5..60)
 		int GetFrameGenerationThreshold() const { return qBound(5, settings.value("settings/frame_generation_threshold", 20).toInt(), 60); }
 		void SetFrameGenerationThreshold(int tenths) { settings.setValue("settings/frame_generation_threshold", qBound(5, tenths, 60)); }
-		// Motion damping strength in percent (0..100)
-		int GetFrameGenerationDamping() const { return qBound(0, settings.value("settings/frame_generation_damping", 70).toInt(), 100); }
-		void SetFrameGenerationDamping(int percent) { settings.setValue("settings/frame_generation_damping", qBound(0, percent, 100)); }
+		// How much of the change in speed predictions take into account, in percent (0..100)
+		int GetFrameGenerationDamping() const { return qBound(0, settings.value("settings/frame_generation_acceleration", 100).toInt(), 100); }
+		void SetFrameGenerationDamping(int percent) { settings.setValue("settings/frame_generation_acceleration", qBound(0, percent, 100)); }
 		bool GetFrameGenerationMarker() const { return settings.value("settings/frame_generation_marker", false).toBool(); }
 		void SetFrameGenerationMarker(bool enabled) { settings.setValue("settings/frame_generation_marker", enabled); }
 		bool GetFrameGenerationControlWindow() const { return settings.value("settings/frame_generation_control_window", true).toBool(); }

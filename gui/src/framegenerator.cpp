@@ -333,16 +333,21 @@ const char *kProjectBody = R"(
             low = c;
     }
     vec4 r = best_e <= fg_tol ? best : (hole_found ? hole : low);
-    // Motion damping: compare with how the same content moved one game frame
-    // earlier. Where it starts, stops, reverses or turns, extrapolate less.
+    // Second-order prediction: compare with how the same content moved one
+    // game frame earlier and continue the change in speed (braking before a
+    // reversal, speeding up when a pan starts). Clamped so that it never more
+    // than doubles the motion and never turns it around on a guess.
     float sp = length(r.xy);
-    if (fg_damp < 0.999 && sp > 0.5) {
+    if (fg_damp > 0.001 && sp > 0.5) {
         vec2 q = y - fg_f * r.xy - r.xy;
         vec2 pv = texelFetch(fg_prevmv, clamp(ivec2(floor(q + 0.5)), ivec2(0), mx), 0).xy;
-        float pl = length(pv);
-        float agree = max(dot(pv, r.xy) / max(pl * sp, 1e-3), 0.0);
-        float consistency = agree * min(pl / sp, 1.0);
-        r.xy *= mix(fg_damp, 1.0, consistency);
+        vec2 v = r.xy + (fg_damp * 0.5 * fg_f) * (r.xy - pv);
+        float lv = length(v);
+        if (lv > 2.0 * sp)
+            v *= 2.0 * sp / lv;
+        if (dot(v, r.xy) < 0.0)
+            v = vec2(0.0);
+        r.xy = v;
     }
     color = r;
 )";
@@ -770,8 +775,8 @@ bool FrameGenerator::fillPass(pl_tex src, pl_tex dst)
 bool FrameGenerator::projectPass(pl_tex mv, pl_tex dst, float factor)
 {
 	float tol = 1.0f;
-	// Strength 0..1 maps to the smallest share of the motion that is kept.
-	float damp = prev_motion_valid ? 1.0f - 0.9f * damping : 1.0f;
+	// Strength of the second-order (acceleration) term, 0 = constant speed.
+	float damp = prev_motion_valid ? damping : 0.0f;
 	return runPass(dispatch, "framegen project", reliabilityHeader(), kProjectBody,
 	               { { "fg_mv", mv, false }, { "fg_prevmv", mv_prev_final, false } },
 	               { { pl_var_float("fg_f"), &factor }, { pl_var_float("fg_tol"), &tol },
@@ -794,7 +799,7 @@ bool FrameGenerator::warpPass(pl_tex src, pl_tex mv, pl_tex dst, float fx, float
 		marker[2] = bicubic ? 0.92f : 0.5f;
 	}
 	return runPass(dispatch, "framegen warp", header, kWarpBody,
-	               { { "fg_src", src, true }, { "fg_mv", mv, true } },
+	               { { "fg_src", src, true }, { "fg_mv", mv, false } },
 	               { { pl_var_vec2("fg_size"), size }, { pl_var_vec2("fg_mv_scale"), scale }, { pl_var_vec4("fg_conf"), conf },
 	                 { pl_var_vec3("fg_marker"), marker } },
 	               dst, timers[kTimerWarp + plane]);

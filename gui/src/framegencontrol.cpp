@@ -94,10 +94,10 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	auto *damping_row = new QHBoxLayout;
 	damping_row->addWidget(damping_slider);
 	damping_row->addWidget(damping_value);
-	auto *damping_label = new QLabel(tr("Bewegungsdämpfung:"));
-	damping_label->setToolTip(tr("Wo sich die Bewegung ändert (Kamera stoppt, startet, dreht um), rät die "
-	                             "Vorhersage weniger weit. Mehr = weniger Verzerrung bei schnellem "
-	                             "Links-Rechts, aber etwas weniger flüssig beim Anfahren."));
+	auto *damping_label = new QLabel(tr("Beschleunigung:"));
+	damping_label->setToolTip(tr("Wie stark die Vorhersage einrechnet, ob die Kamera gerade schneller oder "
+	                             "langsamer wird. Bremst die Kamera vor einem Richtungswechsel, bremst die "
+	                             "Vorhersage mit, statt über das Ziel hinauszuschießen. 0 % = konstante Geschwindigkeit."));
 	damping_slider->setToolTip(damping_label->toolTip());
 	tune_layout->addRow(damping_label, damping_row);
 

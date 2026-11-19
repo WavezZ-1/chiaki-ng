@@ -101,8 +101,10 @@ public:
 	// in 8-bit luma levels (mean absolute difference over a 32x32 block).
 	void setDuplicateThreshold(float levels) { dup_threshold_levels = levels; }
 
-	// How strongly to hold back predictions where the motion changes (start,
-	// stop, reversal, turn): 0 = never, 1 = keep only 10 % of the motion there.
+	// How much of the change in speed between the last two pairs of game
+	// frames predictions take into account (0 = constant speed, 1 = full
+	// constant-acceleration model). Makes predictions brake when the camera
+	// slows down before a reversal.
 	void setDamping(float strength) { damping = std::min(1.0f, std::max(0.0f, strength)); }
 
 	// Draw a small white square in the top-left corner of predicted frames.
@@ -211,7 +213,7 @@ private:
 	bool motion_valid = false;
 	float dup_threshold_levels = 2.0f;
 	bool show_marker = false;
-	float damping = 0.7f;
+	float damping = 1.0f;
 	bool prev_motion_valid = false;
 	bool have_motion_pts = false;
 	double motion_cur_pts = 0.0;
