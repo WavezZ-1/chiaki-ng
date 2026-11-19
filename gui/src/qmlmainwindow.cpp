@@ -6053,7 +6053,12 @@ double QmlMainWindow::frameGenerationTargetHz(int mode) const
     const double display_hz = fg_display_hz.load();
     switch (mode) {
     case 2:
-        return qMin(120.0, display_hz);
+        // The highest rate up to 120 that divides the refresh rate evenly, so
+        // every picture stays on screen for the same number of refreshes
+        // (180 Hz -> 90, 240 Hz -> 120, 120 Hz -> 120).
+        if (display_hz <= 0.0)
+            return 0.0;
+        return display_hz / std::ceil(display_hz / 120.0 - 1e-3);
     case 3:
         return display_hz;
     default:
@@ -6107,7 +6112,7 @@ bool QmlMainWindow::applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src,
     return fg->process(src, pts, out_tex, out);
 }
 
-void QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
+bool QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
 {
     pl_gpu gpu = placeboGpu();
     const double target_hz = frameGenerationTargetHz(frame_generation_mode.loadAcquire());
@@ -6118,16 +6123,16 @@ void QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
             fg_direct_frame_valid = applyFrameGeneration(gpu, &direct_frame, static_cast<double>(now_us) / 1e6,
                                                          fg_direct_tex.data(), &fg_direct_frame);
         }
-        return;
+        return false;
     }
 
-    // Display-rate mode: every render shows the newest real frame or a
-    // prediction for the current time. Direct mapping never re-submits a
-    // frame, so the arrival time serves as pts.
+    // Display-rate mode: a real frame is shown the moment it arrives, the
+    // pacer ticks in between show predictions. Direct mapping never
+    // re-submits a frame, so the arrival time serves as pts.
     FrameGenerator *fg = ensureFrameGenerator(gpu);
     if (!fg) {
         fg_direct_frame_valid = false;
-        return;
+        return false;
     }
     if (new_mapping) {
         bool is_new = true;
@@ -6135,36 +6140,49 @@ void QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
             fg_unique_shown_us = now_us;
             fg_direct_frame_valid = false;
             fg_last_factor = 0.0f;
+            fg_pace_fired_us.store(0);
             armFrameGenPacer(now_us);
-            return;
+            return false;
         }
     }
-    if (!new_mapping) {
-        const qint64 fired_us = fg_pace_fired_us.exchange(0);
-        if (fired_us > 0 && now_us >= fired_us) {
-            fg_pace_renders.fetchAndAddRelaxed(1);
-            fg_pace_dispatch_us.fetchAndAddRelaxed(static_cast<quint64>(now_us - fired_us));
-        }
+    const qint64 fired_us = fg_pace_fired_us.exchange(0);
+    const bool pacer_tick = fired_us > 0;
+    if (pacer_tick && now_us >= fired_us) {
+        fg_pace_renders.fetchAndAddRelaxed(1);
+        fg_pace_dispatch_us.fetchAndAddRelaxed(static_cast<quint64>(now_us - fired_us));
     }
     const double interval = fg->gameFrameInterval();
-    if (fg_unique_shown_us <= 0 || interval <= 0.0 || !fg->canPredict())
-        return;
-    const double factor = static_cast<double>(now_us - fg_unique_shown_us) / 1e6 / interval;
+    if (fg_unique_shown_us <= 0 || interval <= 0.0 || !fg->canPredict() || !fg_pace_thread)
+        return false;
+    // Only pacer ticks change the picture. A repeated stream frame or a render
+    // for another reason shows nothing new; presenting it anyway would put an
+    // extra frame between the ticks (uneven frame times) and could push the
+    // next tick back by one refresh. render() still presents if the UI changed.
+    if (!pacer_tick)
+        return true;
+    // Predict for the tick this render belongs to, so the steps between the
+    // pictures stay equal even if the render runs a little late.
+    const double tick_us = 1e6 / target_hz;
+    const double tick = std::floor(static_cast<double>(now_us - fg_unique_shown_us) / tick_us + 0.5);
+    if (tick < 1.0)
+        return true; // stale tick from before the newest real frame
+    const double factor = tick * tick_us / 1e6 / interval;
     const float max_factor = fg_max_prediction.load();
-    if (factor < 0.04) {
-        fg_direct_frame_valid = false;
-    } else if (factor < 2.0) {
+    if (factor < 2.0) {
         const float target = static_cast<float>(qMin<double>(factor, max_factor));
         // Once the cap is reached the picture holds until the next real frame.
-        if (!fg_direct_frame_valid || qAbs(target - fg_last_factor) > 1e-4f) {
-            fg_direct_frame_valid = fg->predict(&direct_frame, target, fg_direct_tex.data(), &fg_direct_frame);
-            fg_last_factor = fg_direct_frame_valid ? target : 0.0f;
+        if (fg_direct_frame_valid && qAbs(target - fg_last_factor) <= 1e-4f) {
+            armFrameGenPacer(now_us, tick + 1.0);
+            return true;
         }
+        fg_direct_frame_valid = fg->predict(&direct_frame, target, fg_direct_tex.data(), &fg_direct_frame);
+        fg_last_factor = fg_direct_frame_valid ? target : 0.0f;
     }
-    armFrameGenPacer(now_us);
+    armFrameGenPacer(now_us, tick + 1.0);
+    return false;
 }
 
-void QmlMainWindow::armFrameGenPacer(qint64 now_us)
+void QmlMainWindow::armFrameGenPacer(qint64 now_us, double min_next_tick)
 {
     FrameGenerator *fg = frame_generator.load();
     const double target_hz = frameGenerationTargetHz(frame_generation_mode.loadAcquire());
@@ -6176,7 +6194,9 @@ void QmlMainWindow::armFrameGenPacer(qint64 now_us)
     // Refresh ticks are aligned to the moment the newest real frame was shown.
     const double tick_us = 1e6 / target_hz;
     const double elapsed_us = static_cast<double>(now_us - fg_unique_shown_us);
-    const double next_rel_us = (std::floor(elapsed_us / tick_us) + 1.0) * tick_us;
+    // Never the tick that was just shown, even if its render ran late.
+    const double next_tick = qMax(std::floor(elapsed_us / tick_us) + 1.0, min_next_tick);
+    const double next_rel_us = next_tick * tick_us;
     if (next_rel_us / 1e6 / interval > fg_max_prediction.load() + 1e-3)
         return; // nothing new to show before the next real frame
     fg_pace_thread->arm(fg_unique_shown_us + static_cast<qint64>(next_rel_us));
@@ -7146,9 +7166,15 @@ void QmlMainWindow::render()
     const double present_interval_s = refresh_interval_s;
     const bool stream_active = stream_session_active.loadAcquire() != 0;
     const bool timer_owned_playback = stream_active && mixer_active;
-    const double present_submit_interval_s = timer_owned_playback
-        ? present_interval_s
-        : stream_interval_s;
+    // With display-rate frame generation the frame generation pacer decides when
+    // to render. Pacing presents to the stream interval would hold every render
+    // on the stream's grid and cap the output at the stream rate.
+    const bool frame_generation_paced = bypass_frame_queue && stream_active &&
+        frame_generator.load() != nullptr &&
+        frameGenerationTargetHz(frame_generation_mode.loadAcquire()) > 61.0;
+    const double present_submit_interval_s = frame_generation_paced
+        ? 0.0
+        : (timer_owned_playback ? present_interval_s : stream_interval_s);
     const qint64 present_interval_us = static_cast<qint64>(qMax(1.0, vsync_duration * 1000000.0) + 0.5);
     const bool pending_overflow_waiting = hasPendingFrameOverflow();
     const bool pending_frame_waiting = snapshotQueueDepth() >= effectiveQueueDepthLimit() || hasPendingFrame();
@@ -7170,6 +7196,7 @@ void QmlMainWindow::render()
     int queue_depth_before_update = -1;
     quint64 frame_mix_resets = 0;
     struct pl_frame direct_render_frame = {};
+    bool fg_skip_present = false;
     const struct pl_frame *direct_frames[] = { &direct_render_frame };
     // pl_frame_mix timestamps are float before libplacebo API 387 and double from it
     const std::remove_cv_t<std::remove_pointer_t<decltype(pl_frame_mix::timestamps)>> direct_timestamps[] = { 0 };
@@ -7206,7 +7233,7 @@ void QmlMainWindow::render()
             av_frame_free(&incoming);
         }
         if (direct_frame.num_planes > 0)
-            handleDirectFrameGeneration(direct_frame_mapped_now, static_cast<qint64>(chiaki_time_now_monotonic_us()));
+            fg_skip_present = handleDirectFrameGeneration(direct_frame_mapped_now, static_cast<qint64>(chiaki_time_now_monotonic_us()));
         else
             fg_direct_frame_valid = false;
         direct_render_frame = fg_direct_frame_valid ? fg_direct_frame : direct_frame;
@@ -7355,6 +7382,14 @@ void QmlMainWindow::render()
                 render_pending_during_cycle.loadAcquire() > 1 &&
                 quick_begin_wait_last_us > 1500 ? 1 : 0;
         }
+    }
+
+    if (fg_skip_present && render_backend == RenderBackend::Vulkan && !swapchain_recreated &&
+        quick_need_render.loadRelaxed() == 0) {
+        // Frame generation: a repeated stream frame with no UI change, so the
+        // picture on screen is still current. The pacer renders the next one.
+        finalize_render();
+        return;
     }
 
     const qint64 start_frame_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
@@ -7537,7 +7572,9 @@ void QmlMainWindow::render()
                                                             pending_frame_waiting,
                                                             pending_overflow_waiting,
                                                             present_interval_us,
-                                                            static_cast<qint64>(qMax(1.0, present_submit_interval_s * 1000000.0) + 0.5));
+                                                            present_submit_interval_s > 0.0
+                                                                ? static_cast<qint64>(qMax(1.0, present_submit_interval_s * 1000000.0) + 0.5)
+                                                                : 0);
             if (async_enqueued) {
                 async_present_completion = true;
                 present_complete_us = submit_ready_us;

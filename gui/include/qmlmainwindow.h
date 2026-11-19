@@ -358,8 +358,9 @@ private:
     void updateFrameGenerationDisplayRate();
     double frameGenerationTargetHz(int mode) const;
     FrameGenerator *ensureFrameGenerator(pl_gpu gpu);
-    void handleDirectFrameGeneration(bool new_mapping, qint64 now_us);
-    void armFrameGenPacer(qint64 now_us);
+    // Returns true when the render has nothing new to show and can skip presenting.
+    bool handleDirectFrameGeneration(bool new_mapping, qint64 now_us);
+    void armFrameGenPacer(qint64 now_us, double min_next_tick = 1.0);
     uint64_t ts_start = 0;
     double queue_pts_origin = -1.0;
     double newest_queued_frame_pts = -1.0;
