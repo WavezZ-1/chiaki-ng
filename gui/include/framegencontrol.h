@@ -44,6 +44,8 @@ private:
 	QCheckBox *on_top_box;
 
 	QLabel *status_label;
+	QLabel *display_label;
+	QLabel *pacer_label;
 	QLabel *game_fps_label;
 	QLabel *stream_fps_label;
 	QLabel *output_fps_label;

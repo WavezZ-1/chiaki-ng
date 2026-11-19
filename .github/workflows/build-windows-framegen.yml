@@ -2,8 +2,6 @@ name: Build chiaki-ng Windows x86_64 with Frame Generation
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ framegen ]
 
 permissions:
   contents: write

@@ -118,13 +118,18 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	generated_label = valueLabel();
 	gpu_label = valueLabel();
 	metric_label = valueLabel();
+	display_label = valueLabel();
+	pacer_label = valueLabel();
+	pacer_label->setWordWrap(true);
 	live_layout->addRow(tr("Status:"), status_label);
+	live_layout->addRow(tr("Bildschirm:"), display_label);
 	live_layout->addRow(tr("Spiel-fps:"), game_fps_label);
 	live_layout->addRow(tr("Stream-fps:"), stream_fps_label);
 	live_layout->addRow(tr("Ausgabe-fps:"), output_fps_label);
 	live_layout->addRow(tr("Davon vorhergesagt:"), generated_label);
 	live_layout->addRow(tr("GPU-Zeit:"), gpu_label);
 	live_layout->addRow(tr("Bildunterschied:"), metric_label);
+	live_layout->addRow(tr("Taktgeber:"), pacer_label);
 	root->addWidget(live_group);
 
 	hint_label = new QLabel;
@@ -216,6 +221,11 @@ void FrameGenControlWindow::refreshStats()
 	const uint64_t analysed = delta(st.frames, ls.frames);
 	const double predict_ms = generated ? delta(st.gpu_generate_ns, ls.gpu_generate_ns) / 1e6 / generated : 0.0;
 	const double analyse_ms = analysed ? delta(st.gpu_analysis_ns, ls.gpu_analysis_ns) / 1e6 / analysed : 0.0;
+	const uint64_t fires = delta(info.pacer_fires, last_info.pacer_fires);
+	const uint64_t pace_renders = delta(info.pacer_renders, last_info.pacer_renders);
+	const double fires_per_s = dt > 0.0 ? fires / dt : 0.0;
+	const double late_ms = fires ? delta(info.pacer_late_us, last_info.pacer_late_us) / 1000.0 / fires : 0.0;
+	const double dispatch_ms = pace_renders ? delta(info.pacer_dispatch_us, last_info.pacer_dispatch_us) / 1000.0 / pace_renders : 0.0;
 
 	mode_box->setItemText(3, tr("Bildschirmrate (%1 Hz)").arg(qRound(info.display_hz)));
 
@@ -247,6 +257,15 @@ void FrameGenControlWindow::refreshStats()
 	else
 		gpu_label->setText(tr("%1 ms je Vorhersage, %2 ms Analyse je Bild")
 		                   .arg(predict_ms, 0, 'f', 2).arg(analyse_ms, 0, 'f', 2));
+	if (info.paced)
+		display_label->setText(tr("%1 Hz, Ziel %2 fps").arg(qRound(info.display_hz)).arg(qRound(info.target_hz)));
+	else
+		display_label->setText(tr("%1 Hz").arg(qRound(info.display_hz)));
+	if (!info.paced || !sampled)
+		pacer_label->setText(QStringLiteral("–"));
+	else
+		pacer_label->setText(tr("%1 Weckrufe/s, %2 ms zu spät, %3 ms bis zum Bild")
+		                     .arg(fires_per_s, 0, 'f', 0).arg(late_ms, 0, 'f', 2).arg(dispatch_ms, 0, 'f', 2));
 	metric_label->setText(info.mode && info.created
 	                      ? tr("%1 (Schwelle %2)").arg(st.last_metric, 0, 'f', 2)
 	                                               .arg(threshold_slider->value() / 10.0, 0, 'f', 1)
@@ -259,8 +278,9 @@ void FrameGenControlWindow::refreshStats()
 	else if (info.mode >= 2 && info.display_hz <= 61.0)
 		hint = tr("Dieser Bildschirm meldet %1 Hz, mehr als 60 fps sind darauf nicht möglich. "
 		          "Liegt das Fenster auf dem richtigen Monitor?").arg(qRound(info.display_hz));
-	else if (info.mode && sampled && stream_fps >= 1.0 && stream_fps < 50.0)
-		hint = tr("Der Stream kommt nur mit %1 fps an. Unter Settings → Stream „FPS“ auf 60 stellen.")
+	else if (info.mode == 1 && sampled && stream_fps >= 1.0 && stream_fps < 50.0)
+		hint = tr("Der Stream kommt nur mit %1 fps an. Der 60-fps-Modus braucht einen 60-fps-Stream "
+		          "(Settings → Stream „FPS“) – oder nimm „Bis 120 fps“ / „Bildschirmrate“.")
 		       .arg(qRound(stream_fps));
 	hint_label->setText(hint);
 	hint_label->setVisible(!hint.isEmpty());

@@ -66,6 +66,10 @@ struct FrameGenerationInfo
     bool created = false;
     bool supported = true;
     quint64 video_presents = 0;  // video frames rendered so far
+    quint64 pacer_fires = 0;     // pacer wake-ups so far
+    quint64 pacer_late_us = 0;   // total lateness of the wake-ups
+    quint64 pacer_renders = 0;   // renders that followed a wake-up
+    quint64 pacer_dispatch_us = 0; // total time from wake-up to render start
     FrameGeneratorStats stats;
 };
 class DeferredSwapThread;
@@ -153,7 +157,7 @@ public:
     bool applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src, double pts,
                               pl_tex *out_tex, struct pl_frame *out);
     FrameGenerationInfo frameGenerationInfo() const;
-    void requestFrameGenerationRender();
+    void requestFrameGenerationRender(qint64 fired_us);
     QString describePlaceboDiscardReason(qint64 now_us) const;
 
     bool amdCard() const;
@@ -330,6 +334,9 @@ private:
     QAtomicInteger<int> fg_marker = 0;
     std::atomic<double> fg_display_hz{60.0};
     QAtomicInteger<quint64> fg_video_presents = 0;
+    std::atomic<qint64> fg_pace_fired_us{0};
+    QAtomicInteger<quint64> fg_pace_renders = 0;
+    QAtomicInteger<quint64> fg_pace_dispatch_us = 0;
     FrameGenPacerThread *fg_pace_thread = nullptr;
     qint64 fg_unique_shown_us = 0; // render thread: when the newest real frame was shown
     float fg_last_factor = 0.0f;

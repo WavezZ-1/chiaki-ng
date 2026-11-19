@@ -954,6 +954,8 @@ bool FrameGenerator::analyze(const struct pl_frame *src, double pts, bool *is_ne
 	float threshold = dup_threshold_levels;
 	if (cadence_locked)
 		threshold *= dups_since_unique < expected_dups ? 1.5f : 0.75f;
+	else if (cadence < 1.3)
+		threshold *= 0.25f; // stream without repeats: only near-identical frames count as repeats
 	const bool is_dup = ok && have_cur && levels < threshold;
 
 	if (ok && !is_dup) {

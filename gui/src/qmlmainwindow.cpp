@@ -388,10 +388,18 @@ private:
 #ifdef Q_OS_WIN
 #include <windows.h>
 #include <mmsystem.h>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
+#endif
+#include <thread>
 
 // Wakes the renderer at display-refresh ticks between two real video frames so
 // that frame generation can show its predictions at the full display rate.
+//
+// Ticks are only a few milliseconds apart, so the wait has to be precise: it
+// sleeps until shortly before the target (high-resolution waitable timer on
+// Windows) and then spins for the last stretch.
 class FrameGenPacerThread final : public QThread
 {
 public:
@@ -405,7 +413,7 @@ public:
             return;
         wakeup_target_us = target_wakeup_us;
         armed = true;
-        ++generation;
+        generation.fetch_add(1);
         condition.notify_one();
     }
 
@@ -413,19 +421,24 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex);
         stopping = true;
+        stopping_flag.store(true);
         armed = false;
-        ++generation;
+        generation.fetch_add(1);
         condition.notify_one();
     }
+
+    // Statistics for the control window (monotonic totals).
+    quint64 fires() const { return stat_fires.load(); }
+    quint64 lateUsTotal() const { return stat_late_us.load(); }
 
 protected:
     void run() override
     {
 #ifdef Q_OS_WIN
-        // Ticks are only a few milliseconds apart; the default Windows timer
-        // granularity (15.6 ms) would make them fire far too late.
         timeBeginPeriod(1);
+        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 #endif
+        constexpr qint64 kSpinUs = 1500;
         std::unique_lock<std::mutex> lock(mutex);
         while (!stopping) {
             if (!armed) {
@@ -433,26 +446,54 @@ protected:
                 continue;
             }
             const qint64 target = wakeup_target_us;
-            const quint64 observed_generation = generation;
-            const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
-            if (target > now_us) {
-                condition.wait_for(lock, std::chrono::microseconds(target - now_us),
-                    [this, observed_generation]() { return stopping || generation != observed_generation; });
-                if (stopping)
+            const quint64 observed = generation.load();
+            lock.unlock();
+
+            bool superseded = false;
+            for (;;) {
+                const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+                const qint64 remaining = target - now_us;
+                if (remaining <= 0)
                     break;
-                if (generation != observed_generation)
-                    continue;
+                if (generation.load() != observed || stopping_flag.load()) {
+                    superseded = true;
+                    break;
+                }
+                if (remaining > kSpinUs) {
+                    const qint64 sleep_us = remaining - kSpinUs;
+#ifdef Q_OS_WIN
+                    if (timer) {
+                        LARGE_INTEGER due;
+                        due.QuadPart = -static_cast<LONGLONG>(sleep_us) * 10; // relative, 100 ns units
+                        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+                            WaitForSingleObject(timer, INFINITE);
+                            continue;
+                        }
+                    }
+#endif
+                    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+                } else {
+                    std::this_thread::yield();
+                }
             }
+
+            lock.lock();
+            if (stopping)
+                break;
+            if (superseded || generation.load() != observed)
+                continue;
             armed = false;
             lock.unlock();
-            if (owner) {
-                QMetaObject::invokeMethod(owner, [owner = this->owner]() {
-                    owner->requestFrameGenerationRender();
-                }, Qt::QueuedConnection);
-            }
+            const qint64 fired_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+            stat_fires.fetch_add(1);
+            stat_late_us.fetch_add(static_cast<quint64>(qMax<qint64>(0, fired_us - target)));
+            if (owner)
+                owner->requestFrameGenerationRender(fired_us);
             lock.lock();
         }
 #ifdef Q_OS_WIN
+        if (timer)
+            CloseHandle(timer);
         timeEndPeriod(1);
 #endif
     }
@@ -462,9 +503,12 @@ private:
     std::mutex mutex;
     std::condition_variable condition;
     bool stopping = false;
+    std::atomic<bool> stopping_flag{false};
     bool armed = false;
     qint64 wakeup_target_us = 0;
-    quint64 generation = 0;
+    std::atomic<quint64> generation{0};
+    std::atomic<quint64> stat_fires{0};
+    std::atomic<quint64> stat_late_us{0};
 };
 
 class BufferedPlaybackPacerThread final : public QThread
@@ -6092,6 +6136,13 @@ void QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
             return;
         }
     }
+    if (!new_mapping) {
+        const qint64 fired_us = fg_pace_fired_us.exchange(0);
+        if (fired_us > 0 && now_us >= fired_us) {
+            fg_pace_renders.fetchAndAddRelaxed(1);
+            fg_pace_dispatch_us.fetchAndAddRelaxed(static_cast<quint64>(now_us - fired_us));
+        }
+    }
     const double interval = fg->gameFrameInterval();
     if (fg_unique_shown_us <= 0 || interval <= 0.0 || !fg->canPredict())
         return;
@@ -6128,9 +6179,14 @@ void QmlMainWindow::armFrameGenPacer(qint64 now_us)
     fg_pace_thread->arm(fg_unique_shown_us + static_cast<qint64>(next_rel_us));
 }
 
-void QmlMainWindow::requestFrameGenerationRender()
+void QmlMainWindow::requestFrameGenerationRender(qint64 fired_us)
 {
-    scheduleUpdate(false, UpdateRequestReason::Timer);
+    // Called from the pacer thread. Go to the GUI thread once and request the
+    // render right away (like a newly arrived frame) instead of queueing twice.
+    QMetaObject::invokeMethod(this, [this, fired_us]() {
+        fg_pace_fired_us.store(fired_us);
+        scheduleUpdate(true, UpdateRequestReason::PendingFrame);
+    }, Qt::QueuedConnection);
 }
 
 FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
@@ -6142,6 +6198,10 @@ FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
     info.direct_mapping = bypass_frame_queue;
     info.paced = bypass_frame_queue && info.target_hz > 61.0;
     info.video_presents = fg_video_presents.loadRelaxed();
+    info.pacer_fires = fg_pace_thread ? fg_pace_thread->fires() : 0;
+    info.pacer_late_us = fg_pace_thread ? fg_pace_thread->lateUsTotal() : 0;
+    info.pacer_renders = fg_pace_renders.loadRelaxed();
+    info.pacer_dispatch_us = fg_pace_dispatch_us.loadRelaxed();
     FrameGenerator *fg = frame_generator.load();
     info.created = fg != nullptr;
     info.supported = !fg || fg->valid();
