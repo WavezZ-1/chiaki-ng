@@ -126,14 +126,33 @@ jobs:
           cmake --build build --config Release
           cmake --install build
 
+      # The shaderc download badge used upstream no longer exists; use the
+      # shaderc that ships with the Vulkan SDK instead.
       - name: Setup shaderc
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          $url = ((Invoke-WebRequest -UseBasicParsing -Uri "https://storage.googleapis.com/shaderc/badges/build_link_windows_vs2019_release.html").Content | Select-String -Pattern 'url=(.*)"').Matches.Groups[1].Value
-          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile .\shaderc.zip
-          Expand-Archive -LiteralPath "shaderc.zip" -DestinationPath "."
-          cp "./install/*" "./${{ env.dep_folder }}" -Force -Recurse
-          rm "./install" -r -force
+          $sdk = "${{ env.VULKAN_SDK }}".TrimEnd('\')
+          $dep = "${{ github.workspace }}\${{ env.dep_folder }}"
+          New-Item -ItemType Directory -Force -Path "$dep\include", "$dep\lib\pkgconfig", "$dep\bin" | Out-Null
+          foreach ($f in @("$sdk\Include\shaderc\shaderc.h", "$sdk\Lib\shaderc_shared.lib", "$sdk\Bin\shaderc_shared.dll")) {
+            if (!(Test-Path $f)) { Get-ChildItem "$sdk\Lib" | Select-Object -First 50; throw "missing $f" }
+          }
+          Copy-Item -Recurse -Force "$sdk\Include\shaderc" "$dep\include\"
+          Copy-Item -Force "$sdk\Lib\shaderc_shared.lib" "$dep\lib\"
+          Copy-Item -Force "$sdk\Bin\shaderc_shared.dll" "$dep\bin\"
+          $prefix = $dep -replace '\\', '/'
+          $pc = @(
+            "prefix=$prefix",
+            'includedir=${prefix}/include',
+            'libdir=${prefix}/lib',
+            '',
+            'Name: shaderc',
+            'Description: shaderc from the Vulkan SDK',
+            'Version: 2025.1.0',
+            'Libs: -L${libdir} -lshaderc_shared',
+            'Cflags: -I${includedir}'
+          ) -join "`n"
+          Set-Content -Encoding ascii -Path "$dep\lib\pkgconfig\shaderc.pc" -Value $pc
+          Get-Content "$dep\lib\pkgconfig\shaderc.pc"
 
       - name: Make build directory
         run: |
