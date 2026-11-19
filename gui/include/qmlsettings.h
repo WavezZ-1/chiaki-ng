@@ -104,6 +104,7 @@ class QmlSettings : public QObject
 	Q_PROPERTY(int frameGenerationMaxPrediction READ frameGenerationMaxPrediction WRITE setFrameGenerationMaxPrediction NOTIFY frameGenerationChanged)
 	Q_PROPERTY(int frameGenerationThreshold READ frameGenerationThreshold WRITE setFrameGenerationThreshold NOTIFY frameGenerationChanged)
 	Q_PROPERTY(bool frameGenerationMarker READ frameGenerationMarker WRITE setFrameGenerationMarker NOTIFY frameGenerationChanged)
+	Q_PROPERTY(int frameGenerationDamping READ frameGenerationDamping WRITE setFrameGenerationDamping NOTIFY frameGenerationChanged)
 	Q_PROPERTY(bool frameGenerationControlWindow READ frameGenerationControlWindow WRITE setFrameGenerationControlWindow NOTIFY frameGenerationChanged)
 	Q_PROPERTY(bool placeboDeinterlaceEnabled READ placeboDeinterlaceEnabled WRITE setPlaceboDeinterlaceEnabled NOTIFY placeboDeinterlaceEnabledChanged)
 	Q_PROPERTY(int placeboDeinterlacePreset READ placeboDeinterlacePreset WRITE setPlaceboDeinterlacePreset NOTIFY placeboDeinterlacePresetChanged)
@@ -358,6 +359,8 @@ public:
     void setFrameGenerationMaxPrediction(int percent);
     int frameGenerationThreshold() const;
     void setFrameGenerationThreshold(int tenths);
+    int frameGenerationDamping() const;
+    void setFrameGenerationDamping(int percent);
     bool frameGenerationMarker() const;
     void setFrameGenerationMarker(bool enabled);
     bool frameGenerationControlWindow() const;

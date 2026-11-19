@@ -4983,6 +4983,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
     frame_generation_mode.storeRelease(settings->GetFrameGenerationMode());
     fg_max_prediction.store(settings->GetFrameGenerationMaxPrediction() / 100.0f);
     fg_threshold.store(settings->GetFrameGenerationThreshold() / 10.0f);
+    fg_damping.store(settings->GetFrameGenerationDamping() / 100.0f);
     fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     render_backend = settings->GetRenderBackend();
     setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
@@ -6034,6 +6035,7 @@ void QmlMainWindow::loadFrameGenerationSettings()
     frame_generation_mode.storeRelease(settings->GetFrameGenerationMode());
     fg_max_prediction.store(settings->GetFrameGenerationMaxPrediction() / 100.0f);
     fg_threshold.store(settings->GetFrameGenerationThreshold() / 10.0f);
+    fg_damping.store(settings->GetFrameGenerationDamping() / 100.0f);
     fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     updateFrameGenerationDisplayRate();
 }
@@ -6087,6 +6089,7 @@ FrameGenerator *QmlMainWindow::ensureFrameGenerator(pl_gpu gpu)
     if (!fg->valid())
         return nullptr;
     fg->setDuplicateThreshold(fg_threshold.load());
+    fg->setDamping(fg_damping.load());
     fg->setMarker(fg_marker.loadAcquire() != 0);
     return fg;
 }

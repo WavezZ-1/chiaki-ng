@@ -332,7 +332,19 @@ const char *kProjectBody = R"(
         if (fg_cost(c) < fg_cost(low))
             low = c;
     }
-    color = best_e <= fg_tol ? best : (hole_found ? hole : low);
+    vec4 r = best_e <= fg_tol ? best : (hole_found ? hole : low);
+    // Motion damping: compare with how the same content moved one game frame
+    // earlier. Where it starts, stops, reverses or turns, extrapolate less.
+    float sp = length(r.xy);
+    if (fg_damp < 0.999 && sp > 0.5) {
+        vec2 q = y - fg_f * r.xy - r.xy;
+        vec2 pv = texelFetch(fg_prevmv, clamp(ivec2(floor(q + 0.5)), ivec2(0), mx), 0).xy;
+        float pl = length(pv);
+        float agree = max(dot(pv, r.xy) / max(pl * sp, 1e-3), 0.0);
+        float consistency = agree * min(pl / sp, 1.0);
+        r.xy *= mix(fg_damp, 1.0, consistency);
+    }
+    color = r;
 )";
 
 // Catmull-Rom resampling with 9 bilinear taps (keeps generated frames as sharp
@@ -472,6 +484,7 @@ void FrameGenerator::releaseResources()
 	for (auto &t : mvb_level)
 		pl_tex_destroy(gpu, &t);
 	pl_tex_destroy(gpu, &mv_final);
+	pl_tex_destroy(gpu, &mv_prev_final);
 	pl_tex_destroy(gpu, &mv_proj);
 	pl_tex_destroy(gpu, &diff_tex);
 	layout = Layout();
@@ -491,6 +504,8 @@ void FrameGenerator::resetState()
 	frame_interval = 0.0;
 	motion_pending = false;
 	motion_valid = false;
+	prev_motion_valid = false;
+	have_motion_pts = false;
 	stat_cadence.store(cadence);
 	stat_interval.store(0.0);
 	stat_active.store(false);
@@ -598,6 +613,7 @@ bool FrameGenerator::ensureResources(const struct pl_frame *src)
 		ok = ok && (mvb_level[l] = make(lw[l], lh[l], fmt_mv, false));
 	ok = ok && (mv_final = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (mv_proj = make(lw[0], lh[0], fmt_mv, false));
+	ok = ok && (mv_prev_final = make(lw[0], lh[0], fmt_mv, false));
 	const int dw = (lw[kDiffLevel] + kDiffBlock - 1) / kDiffBlock;
 	const int dh = (lh[kDiffLevel] + kDiffBlock - 1) / kDiffBlock;
 	ok = ok && (diff_tex = make(dw, dh, fmt_diff, true));
@@ -754,9 +770,12 @@ bool FrameGenerator::fillPass(pl_tex src, pl_tex dst)
 bool FrameGenerator::projectPass(pl_tex mv, pl_tex dst, float factor)
 {
 	float tol = 1.0f;
+	// Strength 0..1 maps to the smallest share of the motion that is kept.
+	float damp = prev_motion_valid ? 1.0f - 0.9f * damping : 1.0f;
 	return runPass(dispatch, "framegen project", reliabilityHeader(), kProjectBody,
-	               { { "fg_mv", mv, false } },
-	               { { pl_var_float("fg_f"), &factor }, { pl_var_float("fg_tol"), &tol } },
+	               { { "fg_mv", mv, false }, { "fg_prevmv", mv_prev_final, false } },
+	               { { pl_var_float("fg_f"), &factor }, { pl_var_float("fg_tol"), &tol },
+	                 { pl_var_float("fg_damp"), &damp } },
 	               dst, timers[kTimerProject]);
 }
 
@@ -845,10 +864,19 @@ bool FrameGenerator::estimateMotion()
 		if (!searchPass(p.pyramid[l], c.pyramid[l], top ? nullptr : mvb_level[l + 1], mvb_level[l], l, top ? 6 : 1, l >= 3 ? 2 : 1, false))
 			return false;
 	}
+	// Keep the previous field for motion damping. It describes the previous
+	// pair of game frames only if it was estimated for exactly that pair.
+	std::swap(mv_final, mv_prev_final);
+	prev_motion_valid = have_motion_pts && std::fabs(motion_cur_pts - p.pts) < 1e-6;
 	// mv_proj is only needed later in generate(), so it serves as scratch here.
-	return checkPass(mv_level[0], mvb_level[1], mv_proj)
-	    && fillPass(mv_proj, mv_level[0])
-	    && smoothPass(mv_level[0], mv_final);
+	const bool ok = checkPass(mv_level[0], mvb_level[1], mv_proj)
+	             && fillPass(mv_proj, mv_level[0])
+	             && smoothPass(mv_level[0], mv_final);
+	have_motion_pts = ok;
+	motion_cur_pts = c.pts;
+	if (!ok)
+		prev_motion_valid = false;
+	return ok;
 }
 
 bool FrameGenerator::generate(const struct pl_frame *src, float factor, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out)

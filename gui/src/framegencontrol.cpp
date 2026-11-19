@@ -85,6 +85,22 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	prediction_slider->setToolTip(prediction_label->toolTip());
 	tune_layout->addRow(prediction_label, prediction_row);
 
+	damping_slider = new QSlider(Qt::Horizontal);
+	damping_slider->setRange(0, 100);
+	damping_slider->setSingleStep(5);
+	damping_slider->setPageStep(10);
+	damping_value = new QLabel;
+	damping_value->setMinimumWidth(48);
+	auto *damping_row = new QHBoxLayout;
+	damping_row->addWidget(damping_slider);
+	damping_row->addWidget(damping_value);
+	auto *damping_label = new QLabel(tr("Bewegungsdämpfung:"));
+	damping_label->setToolTip(tr("Wo sich die Bewegung ändert (Kamera stoppt, startet, dreht um), rät die "
+	                             "Vorhersage weniger weit. Mehr = weniger Verzerrung bei schnellem "
+	                             "Links-Rechts, aber etwas weniger flüssig beim Anfahren."));
+	damping_slider->setToolTip(damping_label->toolTip());
+	tune_layout->addRow(damping_label, damping_row);
+
 	threshold_slider = new QSlider(Qt::Horizontal);
 	threshold_slider->setRange(5, 60);
 	threshold_slider->setSingleStep(1);
@@ -148,6 +164,11 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 		if (!syncing)
 			this->settings->setFrameGenerationMaxPrediction(value);
 	});
+	connect(damping_slider, &QSlider::valueChanged, this, [this](int value) {
+		damping_value->setText(tr("%1 %").arg(value));
+		if (!syncing)
+			this->settings->setFrameGenerationDamping(value);
+	});
 	connect(threshold_slider, &QSlider::valueChanged, this, [this](int value) {
 		threshold_value->setText(QString::number(value / 10.0, 'f', 1));
 		if (!syncing)
@@ -188,6 +209,8 @@ void FrameGenControlWindow::syncFromSettings()
 	mode_box->setCurrentIndex(settings->frameGenerationMode());
 	prediction_slider->setValue(settings->frameGenerationMaxPrediction());
 	prediction_value->setText(tr("%1 %").arg(prediction_slider->value()));
+	damping_slider->setValue(settings->frameGenerationDamping());
+	damping_value->setText(tr("%1 %").arg(damping_slider->value()));
 	threshold_slider->setValue(settings->frameGenerationThreshold());
 	threshold_value->setText(QString::number(threshold_slider->value() / 10.0, 'f', 1));
 	marker_box->setChecked(settings->frameGenerationMarker());

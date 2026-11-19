@@ -1031,6 +1031,20 @@ void QmlSettings::setFrameGenerationThreshold(int tenths)
     emit placeboChanged();
 }
 
+int QmlSettings::frameGenerationDamping() const
+{
+    return settings->GetFrameGenerationDamping();
+}
+
+void QmlSettings::setFrameGenerationDamping(int percent)
+{
+    if (percent == settings->GetFrameGenerationDamping())
+        return;
+    settings->SetFrameGenerationDamping(percent);
+    emit frameGenerationChanged();
+    emit placeboChanged();
+}
+
 bool QmlSettings::frameGenerationMarker() const
 {
     return settings->GetFrameGenerationMarker();

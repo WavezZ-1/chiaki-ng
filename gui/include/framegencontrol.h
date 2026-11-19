@@ -38,6 +38,8 @@ private:
 	QComboBox *mode_box;
 	QSlider *prediction_slider;
 	QLabel *prediction_value;
+	QSlider *damping_slider;
+	QLabel *damping_value;
 	QSlider *threshold_slider;
 	QLabel *threshold_value;
 	QCheckBox *marker_box;

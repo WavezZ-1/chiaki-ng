@@ -21,6 +21,7 @@
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -99,6 +100,10 @@ public:
 	// Frame-difference threshold below which a frame counts as a repeat,
 	// in 8-bit luma levels (mean absolute difference over a 32x32 block).
 	void setDuplicateThreshold(float levels) { dup_threshold_levels = levels; }
+
+	// How strongly to hold back predictions where the motion changes (start,
+	// stop, reversal, turn): 0 = never, 1 = keep only 10 % of the motion there.
+	void setDamping(float strength) { damping = std::min(1.0f, std::max(0.0f, strength)); }
 
 	// Draw a small white square in the top-left corner of predicted frames.
 	void setMarker(bool enabled) { show_marker = enabled; }
@@ -185,6 +190,7 @@ private:
 	std::array<pl_tex, kLevels> mvb_level{}; // backward motion, levels 1..4
 	pl_tex mv_final = nullptr;
 	pl_tex mv_proj = nullptr;
+	pl_tex mv_prev_final = nullptr; // motion of the previous pair of game frames
 	pl_tex diff_tex = nullptr;
 	std::vector<uint8_t> diff_host;
 
@@ -205,6 +211,10 @@ private:
 	bool motion_valid = false;
 	float dup_threshold_levels = 2.0f;
 	bool show_marker = false;
+	float damping = 0.7f;
+	bool prev_motion_valid = false;
+	bool have_motion_pts = false;
+	double motion_cur_pts = 0.0;
 
 	std::atomic<uint64_t> stat_frames{0};
 	std::atomic<uint64_t> stat_unique{0};
