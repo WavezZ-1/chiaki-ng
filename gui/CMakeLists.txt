@@ -52,6 +52,8 @@ set(SOURCE_FILES
 	src/qmlsettings.cpp
 	include/qmlsvgprovider.h
 	src/qmlsvgprovider.cpp
+	include/framegenerator.h
+	src/framegenerator.cpp
 	include/systemdinhibit.h
 	src/systemdinhibit.cpp
 	)

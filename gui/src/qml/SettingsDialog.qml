@@ -995,6 +995,22 @@ DialogView {
 
                     Label {
                         Layout.alignment: Qt.AlignRight
+                        text: qsTr("Frame Generation:")
+                    }
+
+                    C.CheckBox {
+                        text: qsTr("30 → 60 fps: replace repeated frames with predicted ones (stream at 60 fps)")
+                        checked: Chiaki.settings.frameGeneration
+                        onToggled: Chiaki.settings.frameGeneration = checked
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        text: qsTr("(Unchecked)")
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
                         text: qsTr("Renderer Backend:")
                     }
 

@@ -2236,6 +2236,17 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex,
         av_frame_free(&frame);
         return false;
     }
+    if (q) {
+        struct pl_frame generated;
+        if (q->applyFrameGeneration(gpu, out_frame, src->pts, tex, &generated)) {
+            // The predicted frame lives in the queue's own textures and keeps no
+            // reference to the decoder surface, so release that right away.
+            // `generated.user_data` is NULL, which makes the later
+            // pl_unmap_avframe() in unmap_frame() a no-op.
+            pl_unmap_avframe(gpu, out_frame);
+            *out_frame = generated;
+        }
+    }
     return true;
 }
 
@@ -2619,6 +2630,7 @@ QmlMainWindow::~QmlMainWindow()
 #endif
 
     if (pl_gpu gpu = placeboGpu()) {
+        destroyFrameGenerator(gpu);
         pl_unmap_avframe(gpu, &direct_frame);
         if (quick_tex)
             pl_tex_destroy(gpu, &quick_tex);
@@ -2878,6 +2890,7 @@ void QmlMainWindow::setVideoPreset(VideoPreset preset)
 void QmlMainWindow::setSettings(Settings *new_settings)
 {
     settings = new_settings;
+    frame_generation_enabled.storeRelease(settings && settings->GetFrameGeneration() ? 1 : 0);
     QString profile = settings->GetCurrentProfile();
     qCCritical(chiakiGui) << "Current Profile: " << profile;
     if(profile.isEmpty())
@@ -4835,6 +4848,7 @@ void QmlMainWindow::doneOpenGLContextCurrent()
 void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
 {
     bypass_frame_queue = settings->GetDirectFrameMapping();
+    frame_generation_enabled.storeRelease(settings->GetFrameGeneration() ? 1 : 0);
     render_backend = settings->GetRenderBackend();
     setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
     qparams = {};
@@ -5320,6 +5334,7 @@ renderer_backend_ready:
             dropped_frames = dropped_frames_next;
             emit droppedFramesChanged();
         }
+        updateFrameGenerationStatus();
     });
 
     this->renderparams_opts = pl_options_alloc(this->placebo_log);
@@ -5870,7 +5885,93 @@ void QmlMainWindow::drainDeferredSwaps()
 void QmlMainWindow::updatePlacebo()
 {
     renderparams_changed = true;
+    frame_generation_enabled.storeRelease(settings && settings->GetFrameGeneration() ? 1 : 0);
     schedule_frame_mixer_active.storeRelaxed(configuredFrameMixerEnabledForScheduling() ? 1 : 0);
+}
+
+bool QmlMainWindow::applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src, double pts,
+                                         pl_tex *out_tex, struct pl_frame *out)
+{
+    const bool enabled = frame_generation_enabled.loadAcquire() != 0;
+    FrameGenerator *fg = frame_generator.load();
+    if (!enabled) {
+        if (frame_generation_was_enabled && fg)
+            fg->reset();
+        frame_generation_was_enabled = false;
+        return false;
+    }
+    if (!frame_generation_was_enabled && fg)
+        fg->reset();
+    frame_generation_was_enabled = true;
+
+    if (!fg) {
+        fg = new FrameGenerator(placebo_log, gpu);
+        fg->setLogger([](const char *msg) {
+            qCWarning(chiakiGui) << "[framegen]" << msg;
+        });
+        if (!fg->valid())
+            qCWarning(chiakiGui) << "Frame generation is not supported by this GPU/renderer";
+        else
+            qCInfo(chiakiGui) << "Frame generation initialized";
+        frame_generator.store(fg);
+    }
+    if (!fg->valid())
+        return false;
+    if (!out_tex) {
+        out_tex = fg_fallback_tex[fg_fallback_index % fg_fallback_tex.size()].data();
+        fg_fallback_index++;
+    }
+    return fg->process(src, pts, out_tex, out);
+}
+
+void QmlMainWindow::destroyFrameGenerator(pl_gpu gpu)
+{
+    fg_direct_frame_valid = false;
+    fg_direct_frame = {};
+    delete frame_generator.exchange(nullptr);
+    for (auto &tex : fg_direct_tex)
+        pl_tex_destroy(gpu, &tex);
+    for (auto &set : fg_fallback_tex) {
+        for (auto &tex : set)
+            pl_tex_destroy(gpu, &tex);
+    }
+}
+
+void QmlMainWindow::updateFrameGenerationStatus()
+{
+    QString status;
+    FrameGenerator *fg = frame_generator.load();
+    if (frame_generation_enabled.loadAcquire() == 0) {
+        status = tr("off");
+    } else if (!fg) {
+        status = tr("waiting");
+    } else if (!fg->valid()) {
+        status = tr("unsupported");
+    } else {
+        const FrameGeneratorStats st = fg->stats();
+        const uint64_t generated_now = st.generated - qMin(st.generated, fg_last_generated);
+        const uint64_t frames_now = st.frames - qMin(st.frames, fg_last_frames);
+        const uint64_t generate_ns = st.gpu_generate_ns - qMin(st.gpu_generate_ns, fg_last_generate_ns);
+        const uint64_t analysis_ns = st.gpu_analysis_ns - qMin(st.gpu_analysis_ns, fg_last_analysis_ns);
+        fg_last_generated = st.generated;
+        fg_last_frames = st.frames;
+        fg_last_generate_ns = st.gpu_generate_ns;
+        fg_last_analysis_ns = st.gpu_analysis_ns;
+        if (!st.active) {
+            status = tr("idle (no 30 fps cadence)");
+        } else if (st.gpu_timers && generated_now > 0) {
+            // GPU cost of one predicted frame, including the per-frame analysis
+            const double ms = (static_cast<double>(generate_ns) / generated_now
+                               + (frames_now ? static_cast<double>(analysis_ns) / frames_now : 0.0)) / 1e6;
+            status = tr("+%1 fps, GPU %2 ms").arg(generated_now).arg(ms, 0, 'f', 1);
+        } else {
+            status = tr("+%1 fps").arg(generated_now);
+        }
+    }
+    if (status != frame_generation_status) {
+        frame_generation_status = status;
+        emit frameGenerationStatusChanged();
+    }
 }
 
 void QmlMainWindow::updateVSync()
@@ -6793,10 +6894,12 @@ void QmlMainWindow::render()
         if (reset_direct_frame) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
+            fg_direct_frame_valid = false;
         }
         if (incoming) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
+            fg_direct_frame_valid = false;
             pl_avframe_params avparams = {};
             avparams.frame = incoming;
             avparams.tex = placebo_tex.data();
@@ -6806,10 +6909,15 @@ void QmlMainWindow::render()
                 direct_frame = {};
                 if (backend && backend->zeroCopy())
                     backend->disableZeroCopy();
+            } else if (direct_frame.num_planes > 0) {
+                // Direct mapping never re-submits a frame, so arrival time works as pts.
+                const double arrival_s = static_cast<double>(chiaki_time_now_monotonic_us()) / 1000000.0;
+                fg_direct_frame_valid = applyFrameGeneration(placeboGpu(), &direct_frame, arrival_s,
+                                                             fg_direct_tex.data(), &fg_direct_frame);
             }
             av_frame_free(&incoming);
         }
-        direct_render_frame = direct_frame;
+        direct_render_frame = fg_direct_frame_valid ? fg_direct_frame : direct_frame;
         frame_mix = {};
         frame_mix.num_frames = direct_frame.num_planes > 0 ? 1 : 0;
         frame_mix.frames = direct_frames;

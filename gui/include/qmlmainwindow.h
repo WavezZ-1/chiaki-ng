@@ -24,6 +24,8 @@ extern "C" {
 #include <libplacebo/cache.h>
 }
 
+#include "framegenerator.h"
+
 #include <vulkan/vulkan.h>
 #if defined(Q_OS_LINUX)
 #include <xcb/xcb.h>
@@ -67,6 +69,7 @@ class QmlMainWindow : public QWindow
     Q_PROPERTY(int runtimeRendererBackend READ runtimeRendererBackend CONSTANT)
     Q_PROPERTY(double queueDepthAverage READ queueDepthAverage NOTIFY queueDepthAverageChanged)
     Q_PROPERTY(double pendingFrameAge READ pendingFrameAge NOTIFY pendingFrameAgeChanged)
+    Q_PROPERTY(QString frameGenerationStatus READ frameGenerationStatus NOTIFY frameGenerationStatusChanged)
 
 public:
     enum class UpdateRequestReason {
@@ -127,6 +130,13 @@ public:
 
     double queueDepthAverage() const;
     double pendingFrameAge() const;
+    QString frameGenerationStatus() const { return frame_generation_status; }
+
+    // Called on the render thread right after a video frame was mapped. Returns
+    // true if the frame repeats the previous game frame and `out` now holds a
+    // predicted replacement (see FrameGenerator).
+    bool applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src, double pts,
+                              pl_tex *out_tex, struct pl_frame *out);
     QString describePlaceboDiscardReason(qint64 now_us) const;
 
     bool amdCard() const;
@@ -180,6 +190,7 @@ signals:
     void directStreamChanged();
     void queueDepthAverageChanged();
     void pendingFrameAgeChanged();
+    void frameGenerationStatusChanged();
     void loadingTransitionCompleteChanged();
     void statsOverlayActiveChanged();
 
@@ -294,6 +305,22 @@ private:
     AVFrame *direct_pending_frame = nullptr;
     struct pl_frame direct_frame = {};
     QAtomicInteger<int> direct_frame_reset = 0;
+    // Frame generation (render thread only, except the atomics)
+    std::atomic<FrameGenerator *> frame_generator{nullptr};
+    QAtomicInteger<int> frame_generation_enabled = 0;
+    bool frame_generation_was_enabled = false;
+    std::array<pl_tex, PL_MAX_PLANES> fg_direct_tex{};
+    std::array<std::array<pl_tex, PL_MAX_PLANES>, 4> fg_fallback_tex{};
+    unsigned fg_fallback_index = 0;
+    struct pl_frame fg_direct_frame = {};
+    bool fg_direct_frame_valid = false;
+    QString frame_generation_status;
+    uint64_t fg_last_generated = 0;
+    uint64_t fg_last_frames = 0;
+    uint64_t fg_last_generate_ns = 0;
+    uint64_t fg_last_analysis_ns = 0;
+    void destroyFrameGenerator(pl_gpu gpu);
+    void updateFrameGenerationStatus();
     uint64_t ts_start = 0;
     double queue_pts_origin = -1.0;
     double newest_queued_frame_pts = -1.0;

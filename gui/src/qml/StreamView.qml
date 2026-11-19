@@ -403,6 +403,28 @@ Item {
 
                 Label {
                     Layout.alignment: Qt.AlignRight
+                    text: qsTr("frame generation")
+                    font.pixelSize: 15
+                    opacity: Chiaki.session ? 1 : 0
+                    visible: opacity > 0
+
+                    Behavior on opacity { NumberAnimation { duration: 250 } }
+
+                    Label {
+                        anchors {
+                            right: parent.left
+                            baseline: parent.baseline
+                            rightMargin: 5
+                        }
+                        text: parent.visible ? Chiaki.window.frameGenerationStatus : ""
+                        font.bold: true
+                        color: "#a5d6a7"
+                        font.pixelSize: 18
+                    }
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
                     text: qsTr("dropped frames")
                     font.pixelSize: 15
                     opacity: Chiaki.session ? 1 : 0
