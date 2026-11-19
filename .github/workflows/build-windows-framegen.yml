@@ -55,12 +55,39 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Setup Qt
+      # aqtinstall 3.3 currently cannot find the Qt 6.12 packages, so try the
+      # newest series first and fall back to older ones. Qt is cached between runs.
+      - name: Setup Qt 6.12
+        id: qt612
+        continue-on-error: true
         uses: jurplel/install-qt-action@v4
         with:
-          version: "6.12.0"
+          version: "6.12.*"
           host: 'windows'
           target: 'desktop'
+          cache: true
+          modules: 'qtwebengine qtpositioning qtwebchannel qtwebsockets qtserialport'
+
+      - name: Setup Qt 6.11 (fallback)
+        id: qt611
+        if: steps.qt612.outcome == 'failure'
+        continue-on-error: true
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.11.*"
+          host: 'windows'
+          target: 'desktop'
+          cache: true
+          modules: 'qtwebengine qtpositioning qtwebchannel qtwebsockets qtserialport'
+
+      - name: Setup Qt 6.10 (fallback)
+        if: steps.qt612.outcome == 'failure' && steps.qt611.outcome == 'failure'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.*"
+          host: 'windows'
+          target: 'desktop'
+          cache: true
           modules: 'qtwebengine qtpositioning qtwebchannel qtwebsockets qtserialport'
 
       - name: Install pip dependencies
