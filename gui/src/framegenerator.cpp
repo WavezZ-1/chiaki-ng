@@ -41,6 +41,9 @@ constexpr float kConfAbsHigh = 0.08f;
 constexpr float kConfRelLow = 0.45f;
 constexpr float kConfRelHigh = 0.85f;
 
+// Motion search: cost per level-0 pixel of deviating from the reference vector.
+constexpr float kSmoothLambda = 0.0001f;
+
 // A match is "unreliable" (e.g. newly uncovered background) above these costs.
 constexpr float kBadAbs = 0.03f;
 constexpr float kBadRel = 0.6f;
@@ -146,7 +149,7 @@ float fg_sad(sampler2D c, sampler2D p, ivec2 pos, ivec2 d, ivec2 mx)
 const char *kSearchBody = R"(
     ivec2 pos = ivec2(gl_FragCoord.xy);
     ivec2 mx = textureSize(fg_cur, 0) - 1;
-    vec2 cand[6];
+    vec2 cand[9];
     int nc = 0;
 #if FG_USE_PARENT
     ivec2 pmx = textureSize(fg_parent, 0) - 1;
@@ -162,6 +165,30 @@ const char *kSearchBody = R"(
     cand[nc] = vec2(0.0);
     nc++;
 #endif
+#if FG_TEMPORAL
+    // The motion of the previous pair of frames, here and for the whole
+    // picture: a fast camera turn continues, so the search starts where the
+    // content went last time and reaches far beyond its own window.
+    {
+        ivec2 tmx = textureSize(fg_tmv, 0) - 1;
+        ivec2 tp = clamp(pos * FG_TSCALE + FG_TSCALE / 2, ivec2(0), tmx);
+        cand[nc] = texelFetch(fg_tmv, tp, 0).xy * (fg_tratio / float(FG_TSCALE));
+        nc++;
+        cand[nc] = texelFetch(fg_tglobal, ivec2(0), 0).xy * (fg_tratio / float(FG_TSCALE));
+        nc++;
+    }
+#endif
+    // Smoothness: deviating from the reference (the coarser level's vector,
+    // or the previous motion / zero at the top) costs a little, so flat areas
+    // that match any vector equally well move with their surroundings
+    // instead of falling back to "no motion".
+#if FG_USE_PARENT
+    vec2 ref = cand[0];
+#elif FG_TEMPORAL
+    vec2 ref = cand[nc - 1];
+#else
+    vec2 ref = vec2(0.0);
+#endif
     float best = 1e9;
     vec2 bestv = vec2(0.0);
     for (int c = 0; c < nc; c++) {
@@ -175,7 +202,7 @@ const char *kSearchBody = R"(
         for (int dy = -FG_R; dy <= FG_R; dy++) {
             for (int dx = -FG_R; dx <= FG_R; dx++) {
                 vec2 d = base + vec2(float(dx), float(dy));
-                float cost = fg_sad(fg_cur, fg_prev, pos, ivec2(d), mx) + fg_lambda * length(d);
+                float cost = fg_sad(fg_cur, fg_prev, pos, ivec2(d), mx) + fg_lambda * length(d - ref);
                 if (cost < best) {
                     best = cost;
                     bestv = d;
@@ -214,6 +241,31 @@ const char *kSmoothBody = R"(
     for (int i = 0; i < 9; i++) {
         float s = 0.0;
         for (int j = 0; j < 9; j++)
+            s += abs(v[i].x - v[j].x) + abs(v[i].y - v[j].y);
+        if (s < best) {
+            best = s;
+            bestv = v[i];
+        }
+    }
+    color = bestv;
+)";
+
+// 5x5 vector median of the interpolation field (m, weight): neighbouring
+// pixels that pick different vectors would tear the picture into blocks;
+// the median keeps coherent regions and their edges and drops the stray ones.
+const char *kInterpSmoothBody = R"(
+    ivec2 pos = ivec2(gl_FragCoord.xy);
+    ivec2 mx = textureSize(fg_src, 0) - 1;
+    vec4 v[25];
+    for (int y = 0; y < 5; y++) {
+        for (int x = 0; x < 5; x++)
+            v[y * 5 + x] = texelFetch(fg_src, clamp(pos + ivec2(x - 2, y - 2), ivec2(0), mx), 0);
+    }
+    float best = 1e9;
+    vec4 bestv = v[12];
+    for (int i = 0; i < 25; i++) {
+        float s = 0.0;
+        for (int j = 0; j < 25; j++)
             s += abs(v[i].x - v[j].x) + abs(v[i].y - v[j].y);
         if (s < best) {
             best = s;
@@ -315,6 +367,23 @@ const char *kGlobalBody = R"(
 // so in gaps at least 8 pixels wide a neighbour moving with the dominant
 // (background) motion, found within twice the distance of the nearest one,
 // wins over an object vector next to the gap.
+// Mean luma difference over a 5x5 patch between this frame (a) at pos and
+// the other frame (b) at pos - v (both at level 0).
+const char *kFillHeader = R"(
+float fg_fill_sad(sampler2D a, sampler2D b, ivec2 pos, vec2 v, ivec2 mx)
+{
+    float acc = 0.0;
+    ivec2 d = ivec2(floor(v + 0.5));
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            ivec2 q = clamp(pos + ivec2(x, y), ivec2(0), mx);
+            acc += abs(texelFetch(a, q, 0).r - texelFetch(b, clamp(q - d, ivec2(0), mx), 0).r);
+        }
+    }
+    return acc * (1.0 / 25.0);
+}
+)";
+
 const char *kFillBody = R"(
     ivec2 pos = ivec2(gl_FragCoord.xy);
     ivec2 mx = textureSize(fg_mv, 0) - 1;
@@ -361,7 +430,23 @@ const char *kFillBody = R"(
                 break;
         }
         vec4 pick = bgz < 1e8 ? bg : near;
-        color = (bgz < 1e8 || nearz < 1e8) ? vec4(pick.xy, -1.0, c.w) : c;
+        // Not every unmatched area is uncovered background: a character that
+        // turns or animates changes its look and fails to match as well. If
+        // the picture itself clearly says the content here moves with its
+        // nearest neighbour or not at all, that beats the background vector.
+        // (In truly uncovered areas no vector matches, so this changes nothing.)
+        if (bgz < 1e8 || nearz < 1e8) {
+            float pc = fg_fill_sad(fg_a, fg_b, pos, pick.xy, mx);
+            float nc = nearz < 1e8 ? fg_fill_sad(fg_a, fg_b, pos, near.xy, mx) : 1e9;
+            float zc = fg_fill_sad(fg_a, fg_b, pos, vec2(0.0), mx);
+            if (nc < 0.75 * pc && nc <= zc)
+                pick = near;
+            else if (zc < 0.75 * pc)
+                pick = vec4(0.0, 0.0, zc, zc);
+            color = vec4(pick.xy, -1.0, c.w);
+        } else {
+            color = c;
+        }
     }
 )";
 
@@ -550,14 +635,15 @@ const char *kInterpBody = R"(
         m = mf; w = 1.0;                   // uncovered: only in the newest frame
     } else if (bok && !bgood && !fgood) {
         m = mb; w = 0.0;                   // being covered: only in the previous frame
-    } else if (fgood && bgood) {
-        m = pf <= pb ? mf : mb;
-    } else if (fgood) {
-        m = mf;
-    } else if (bgood) {
-        m = mb;
     } else {
-        m = pf <= pb ? mf : mb;
+        if (fgood && bgood)
+            m = pf <= pb ? mf : mb;
+        else if (fgood)
+            m = mf;
+        else if (bgood)
+            m = mb;
+        else
+            m = pf <= pb ? mf : mb;
     }
     color = vec4(m, w, 0.0);
 )";
@@ -705,6 +791,7 @@ void FrameGenerator::releaseResources()
 	pl_tex_destroy(gpu, &tile_tex);
 	pl_tex_destroy(gpu, &path_tex);
 	pl_tex_destroy(gpu, &global_tex);
+	pl_tex_destroy(gpu, &global_back_tex);
 	pl_tex_destroy(gpu, &mv_prev_final);
 	pl_tex_destroy(gpu, &mv_proj);
 	pl_tex_destroy(gpu, &diff_tex);
@@ -838,6 +925,7 @@ bool FrameGenerator::ensureResources(const struct pl_frame *src)
 	ok = ok && (tile_tex = make(16, 9, fmt_mv, false));
 	ok = ok && (path_tex = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (global_tex = make(1, 1, fmt_mv, false));
+	ok = ok && (global_back_tex = make(1, 1, fmt_mv, false));
 	ok = ok && (mv_final = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (mv_proj = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (mv_prev_final = make(lw[0], lh[0], fmt_mv, false));
@@ -856,7 +944,7 @@ bool FrameGenerator::ensureResources(const struct pl_frame *src)
 }
 
 static bool runPass(pl_dispatch dp, const char *description, const std::string &header, const char *body,
-                    std::initializer_list<TexArg> texs, std::initializer_list<VarArg> vars, pl_tex target,
+                    const std::vector<TexArg> &texs, const std::vector<VarArg> &vars, pl_tex target,
                     pl_timer timer)
 {
 	std::vector<struct pl_shader_desc> descs;
@@ -938,32 +1026,35 @@ bool FrameGenerator::diffPass(pl_tex a, pl_tex b, pl_tex dst)
 	               { { "fg_a", a, false }, { "fg_b", b, false } }, {}, dst, timers[kTimerDiff]);
 }
 
-bool FrameGenerator::searchPass(pl_tex cur, pl_tex prev, pl_tex parent, pl_tex dst, int level, int radius, int patch, bool subpixel)
+bool FrameGenerator::searchPass(pl_tex cur, pl_tex prev, pl_tex parent, pl_tex dst, int level, int radius, int patch, bool subpixel,
+                                pl_tex temporal, float temporal_ratio)
 {
-	// The zero vector is offered on the coarse levels, where it lets static
-	// overlays (HUD, subtitles) snap to "no motion"; finer levels inherit it.
-	const bool zero = !parent || level >= 2;
-	char defs[192];
-	std::snprintf(defs, sizeof(defs), "#define FG_R %d\n#define FG_P %d\n#define FG_USE_PARENT %d\n#define FG_SUBPIXEL %d\n#define FG_ZERO %d\n",
-	              radius, patch, parent ? 1 : 0, subpixel ? 1 : 0, zero ? 1 : 0);
+	// The zero vector is offered on every level, so static overlays (HUD,
+	// minimap, subtitles) keep "no motion" down to full detail even when the
+	// coarse blocks around them follow the moving picture.
+	const bool zero = true;
+	const int tscale = 1 << level; // level-0 pixels per pixel of this level
+	char defs[256];
+	std::snprintf(defs, sizeof(defs), "#define FG_R %d\n#define FG_P %d\n#define FG_USE_PARENT %d\n#define FG_SUBPIXEL %d\n#define FG_ZERO %d\n"
+	              "#define FG_TEMPORAL %d\n#define FG_TSCALE %d\n",
+	              radius, patch, parent ? 1 : 0, subpixel ? 1 : 0, zero ? 1 : 0, temporal ? 1 : 0, tscale);
 	const std::string header = std::string(defs) + kSearchHeader;
 
-	// Small bias towards short vectors so that flat or repetitive areas prefer
-	// the smallest consistent motion. Scaled so it stays a tie-breaker at
-	// every level (vectors double in length from one level to the next).
-	float lambda = 0.0005f * std::pow(0.5f, static_cast<float>(kLevels - 1 - level));
+	// Bias towards the reference vector (see the shader), per pixel of this
+	// level: a level-l pixel is 2^l level-0 pixels.
+	float lambda = kSmoothLambda * std::pow(2.0f, static_cast<float>(level));
 	pl_timer timer = timers[(dst == mvb_level[level] ? kTimerSearchBack : kTimerSearch) + level];
 
-	if (parent) {
-		return runPass(dispatch, "framegen search", header, kSearchBody,
-		               { { "fg_cur", cur, false }, { "fg_prev", prev, false }, { "fg_parent", parent, false } },
-		               { { pl_var_float("fg_lambda"), &lambda } },
-		               dst, timer);
+	std::vector<TexArg> texs = { { "fg_cur", cur, false }, { "fg_prev", prev, false } };
+	if (parent)
+		texs.push_back({ "fg_parent", parent, false });
+	std::vector<VarArg> vars = { { pl_var_float("fg_lambda"), &lambda } };
+	if (temporal) {
+		texs.push_back({ "fg_tmv", temporal, false });
+		texs.push_back({ "fg_tglobal", global_tex, false });
+		vars.push_back({ pl_var_float("fg_tratio"), &temporal_ratio });
 	}
-	return runPass(dispatch, "framegen search", header, kSearchBody,
-	               { { "fg_cur", cur, false }, { "fg_prev", prev, false } },
-	               { { pl_var_float("fg_lambda"), &lambda } },
-	               dst, timer);
+	return runPass(dispatch, "framegen search", header, kSearchBody, texs, vars, dst, timer);
 }
 
 bool FrameGenerator::smoothPass(pl_tex src, pl_tex dst, int timer)
@@ -992,13 +1083,20 @@ bool FrameGenerator::fillPass(pl_tex src, pl_tex dst, int timer)
 {
 	// Dominant motion of `src` first (tiles, then one texel).
 	const bool backward = timer == kTimerFillBack;
+	pl_tex global = backward ? global_back_tex : global_tex;
 	if (!runPass(dispatch, "framegen tiles", reliabilityHeader(), kTileBody,
 	             { { "fg_mv", src, false } }, {}, tile_tex, timers[backward ? kTimerTilesBack : kTimerTiles])
 	    || !runPass(dispatch, "framegen global", std::string(), kGlobalBody,
-	                { { "fg_tiles", tile_tex, false } }, {}, global_tex, timers[backward ? kTimerGlobalBack : kTimerGlobal]))
+	                { { "fg_tiles", tile_tex, false } }, {}, global, timers[backward ? kTimerGlobalBack : kTimerGlobal]))
 		return false;
-	return runPass(dispatch, "framegen fill", reliabilityHeader(), kFillBody,
-	               { { "fg_mv", src, false }, { "fg_global", global_tex, false } }, {}, dst, timers[timer]);
+	// The field's own frame and the frame its vectors point into.
+	const Slot &c = history[cur_slot];
+	const Slot &p = history[prev_slot];
+	pl_tex own = backward ? p.pyramid[0] : c.pyramid[0];
+	pl_tex other = backward ? c.pyramid[0] : p.pyramid[0];
+	return runPass(dispatch, "framegen fill", reliabilityHeader() + kFillHeader, kFillBody,
+	               { { "fg_mv", src, false }, { "fg_global", global, false },
+	                 { "fg_a", own, false }, { "fg_b", other, false } }, {}, dst, timers[timer]);
 }
 
 bool FrameGenerator::interpPass(float t, pl_tex dst)
@@ -1129,18 +1227,27 @@ bool FrameGenerator::estimateMotion()
 {
 	const Slot &c = history[cur_slot];
 	const Slot &p = history[prev_slot];
+	// The previous pair's motion (still in mv_final and global_tex at this
+	// point) as a starting point, if it was estimated for the pair just before.
+	const bool temporal = have_motion_pts && std::fabs(motion_cur_pts - p.pts) < 1e-6;
+	const int frames_now = frame_interval > 0.0
+	    ? std::max(1, static_cast<int>(std::lround((c.pts - p.pts) / frame_interval)))
+	    : 1;
+	const float tratio = static_cast<float>(frames_now) / static_cast<float>(std::max(1, pair_frames));
 	// Current -> previous, coarse to fine, down to level 0 (half resolution).
 	for (int l = kLevels - 1; l >= 0; l--) {
 		const bool top = l == kLevels - 1;
-		const int radius = top ? 6 : 1;   // +-192 px at the top level, +-30 px from refinements
-		const int patch = l >= 3 ? 2 : 1; // 5x5 on the two coarsest levels, 3x3 below
-		if (!searchPass(c.pyramid[l], p.pyramid[l], top ? nullptr : mv_level[l + 1], mv_level[l], l, radius, patch, l == 0))
+		const int radius = top ? 6 : 1;   // +-192 px around each start at the top level, +-30 px from refinements
+		const int patch = l >= 1 ? 2 : 1; // 5x5 down to quarter resolution, 3x3 at half resolution
+		if (!searchPass(c.pyramid[l], p.pyramid[l], top ? nullptr : mv_level[l + 1], mv_level[l], l, radius, patch, l == 0,
+		                (top || l == 2) && temporal ? mv_final : nullptr, tratio))
 			return false;
 	}
 	// Previous -> current, down to level 1 only; used for the occlusion check.
 	for (int l = kLevels - 1; l >= 1; l--) {
 		const bool top = l == kLevels - 1;
-		if (!searchPass(p.pyramid[l], c.pyramid[l], top ? nullptr : mvb_level[l + 1], mvb_level[l], l, top ? 6 : 1, l >= 3 ? 2 : 1, false))
+		if (!searchPass(p.pyramid[l], c.pyramid[l], top ? nullptr : mvb_level[l + 1], mvb_level[l], l, top ? 6 : 1, l >= 3 ? 2 : 1, false,
+		                (top || l == 2) && temporal ? mv_final : nullptr, -tratio))
 			return false;
 	}
 	// Keep the previous field for motion damping. It describes the previous
@@ -1217,7 +1324,12 @@ bool FrameGenerator::interpolate(const struct pl_frame *meta, float t, pl_tex ou
 		}
 	}
 	t = std::min(1.0f, std::max(0.0f, t));
-	if (!interpPass(t, mv_proj) || !accelPass(t, mv_proj, path_tex)) {
+	// mv_level[0] is free once the final fields exist, so it holds the
+	// smoothed interpolation field.
+	if (!interpPass(t, mv_proj)
+	    || !runPass(dispatch, "framegen interpolate smooth", std::string(), kInterpSmoothBody,
+	                { { "fg_src", mv_proj, false } }, {}, mv_level[0], timers[kTimerInterpSmooth])
+	    || !accelPass(t, mv_level[0], path_tex)) {
 		recordFailure();
 		return false;
 	}
@@ -1236,7 +1348,7 @@ bool FrameGenerator::interpolate(const struct pl_frame *meta, float t, pl_tex ou
 		const float fx = 2.0f * (layout.w[i] / lw);
 		const float fy = 2.0f * (layout.h[i] / lh);
 		if (!pl_tex_recreate(gpu, &out_tex[i], &params)
-		    || !blendPass(p.planes[i], c.planes[i], mv_proj, out_tex[i], fx, fy, t, i == layout.luma_plane, i)) {
+		    || !blendPass(p.planes[i], c.planes[i], mv_level[0], out_tex[i], fx, fy, t, i == layout.luma_plane, i)) {
 			recordFailure();
 			return false;
 		}
