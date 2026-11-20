@@ -64,6 +64,10 @@ struct FrameGenerationInfo
     bool direct_mapping = true;  // display-rate modes need direct frame mapping
     bool paced = false;          // display-rate mode is in effect
     double delay_ms = 0.0;       // how much later than the newest real frame pictures are shown
+    int src_w = 0, src_h = 0;    // stream picture
+    int dst_w = 0, dst_h = 0;    // size it is shown at
+    int upscaler = 0;            // 0 standard scaler, 1 FSR, 2 FSRCNNX 8, 3 FSRCNNX 16
+    int sharpening = 0;          // percent, 0 = off
     bool created = false;
     bool supported = true;
     quint64 video_presents = 0;  // video frames rendered so far
@@ -536,6 +540,14 @@ private:
     const struct pl_hook *fsr_hook = nullptr;
     const struct pl_hook *fsrcnnx_hook_8 = nullptr;
     const struct pl_hook *fsrcnnx_hook_16 = nullptr;
+    const struct pl_hook *sharpen_hook = nullptr;
+    std::atomic<float> sharpen_strength{0.3f};
+    // What the renderer last did with the picture (for the control window).
+    std::atomic<int> scale_src_w{0};
+    std::atomic<int> scale_src_h{0};
+    std::atomic<int> scale_dst_w{0};
+    std::atomic<int> scale_dst_h{0};
+    std::atomic<int> scale_kind{0};
 
     struct {
         PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;

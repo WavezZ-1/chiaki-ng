@@ -152,6 +152,7 @@ private:
 		kTimerGlobal,
 		kTimerTilesBack,
 		kTimerGlobalBack,
+		kTimerAccel,
 		kTimerCount
 	};
 
@@ -188,6 +189,7 @@ private:
 	bool checkPass(pl_tex fwd, pl_tex bwd, pl_tex dst, int timer = kTimerCheck);
 	bool fillPass(pl_tex src, pl_tex dst, int timer = kTimerFill);
 	bool interpPass(float t, pl_tex dst);
+	bool accelPass(float t, pl_tex mv, pl_tex dst);
 	bool blendPass(pl_tex prev, pl_tex cur, pl_tex mv, pl_tex dst, float fx, float fy, float t, bool bicubic, int plane);
 	bool projectPass(pl_tex mv, pl_tex dst, float factor);
 	bool warpPass(pl_tex src, pl_tex mv, pl_tex dst, float fx, float fy, bool bicubic, int plane);
@@ -218,6 +220,7 @@ private:
 	pl_tex mvb_final = nullptr;     // backward motion at full detail, for interpolation
 	pl_tex tile_tex = nullptr;      // dominant motion per tile (16x9)
 	pl_tex global_tex = nullptr;    // dominant motion of the whole picture (1x1)
+	pl_tex path_tex = nullptr;      // interpolation: offset into the previous frame
 	pl_tex mv_proj = nullptr;
 	pl_tex mv_prev_final = nullptr; // motion of the previous pair of game frames
 	pl_tex diff_tex = nullptr;
@@ -237,6 +240,8 @@ private:
 	double cadence = 1.0;
 	double frame_interval = 0.0;
 	int long_gaps = 0;
+	int pair_frames = 1;       // game frames between the two newest real frames
+	int prev_pair_frames = 1;  // the same for the pair before
 	bool motion_pending = false;
 	bool motion_valid = false;
 	bool backward_valid = false;

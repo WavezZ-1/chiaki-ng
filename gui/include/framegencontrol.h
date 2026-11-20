@@ -37,6 +37,10 @@ private:
 
 	QComboBox *mode_box;
 	QComboBox *method_box;
+	QComboBox *scaler_box;
+	QSlider *sharpen_slider;
+	QLabel *sharpen_value;
+	QLabel *picture_label;
 	QSlider *prediction_slider;
 	QLabel *prediction_value;
 	QSlider *damping_slider;

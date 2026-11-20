@@ -106,6 +106,7 @@ class QmlSettings : public QObject
 	Q_PROPERTY(bool frameGenerationMarker READ frameGenerationMarker WRITE setFrameGenerationMarker NOTIFY frameGenerationChanged)
 	Q_PROPERTY(int frameGenerationDamping READ frameGenerationDamping WRITE setFrameGenerationDamping NOTIFY frameGenerationChanged)
 	Q_PROPERTY(int frameGenerationDelay READ frameGenerationDelay WRITE setFrameGenerationDelay NOTIFY frameGenerationChanged)
+	Q_PROPERTY(int sharpening READ sharpening WRITE setSharpening NOTIFY frameGenerationChanged)
 	Q_PROPERTY(bool frameGenerationControlWindow READ frameGenerationControlWindow WRITE setFrameGenerationControlWindow NOTIFY frameGenerationChanged)
 	Q_PROPERTY(bool placeboDeinterlaceEnabled READ placeboDeinterlaceEnabled WRITE setPlaceboDeinterlaceEnabled NOTIFY placeboDeinterlaceEnabledChanged)
 	Q_PROPERTY(int placeboDeinterlacePreset READ placeboDeinterlacePreset WRITE setPlaceboDeinterlacePreset NOTIFY placeboDeinterlacePresetChanged)
@@ -364,6 +365,8 @@ public:
     void setFrameGenerationDamping(int percent);
     int frameGenerationDelay() const;
     void setFrameGenerationDelay(int percent);
+    int sharpening() const;
+    void setSharpening(int percent);
     bool frameGenerationMarker() const;
     void setFrameGenerationMarker(bool enabled);
     bool frameGenerationControlWindow() const;

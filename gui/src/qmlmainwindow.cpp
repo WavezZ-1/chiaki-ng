@@ -2828,6 +2828,7 @@ QmlMainWindow::~QmlMainWindow()
     pl_mpv_user_shader_destroy(&fsr_hook);
     pl_mpv_user_shader_destroy(&fsrcnnx_hook_8);
     pl_mpv_user_shader_destroy(&fsrcnnx_hook_16);
+    pl_mpv_user_shader_destroy(&sharpen_hook);
     if (render_backend == RenderBackend::Vulkan) {
         pl_vulkan_destroy(&placebo_vulkan);
         pl_vk_inst_destroy(&placebo_vk_inst);
@@ -4985,6 +4986,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
     fg_threshold.store(settings->GetFrameGenerationThreshold() / 10.0f);
     fg_damping.store(settings->GetFrameGenerationDamping() / 100.0f);
     fg_delay.store(settings->GetFrameGenerationDelay() / 100.0f);
+    sharpen_strength.store(settings->GetSharpening() / 100.0f);
     fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     render_backend = settings->GetRenderBackend();
     setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
@@ -5483,6 +5485,7 @@ renderer_backend_ready:
     this->fsr_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSR.glsl"));
     this->fsrcnnx_hook_8 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_8-0-4-1.glsl"));
     this->fsrcnnx_hook_16 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_16-0-4-1.glsl"));
+    this->sharpen_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/CAS.glsl"));
 
 
     switch (settings->GetPlaceboPreset()) {
@@ -6038,6 +6041,7 @@ void QmlMainWindow::loadFrameGenerationSettings()
     fg_threshold.store(settings->GetFrameGenerationThreshold() / 10.0f);
     fg_damping.store(settings->GetFrameGenerationDamping() / 100.0f);
     fg_delay.store(settings->GetFrameGenerationDelay() / 100.0f);
+    sharpen_strength.store(settings->GetSharpening() / 100.0f);
     fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     updateFrameGenerationDisplayRate();
 }
@@ -6278,6 +6282,12 @@ FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
         info.stats = fg->stats();
     if (info.paced && fg)
         info.delay_ms = frameGenerationDelaySeconds(info.stats.frame_interval, info.target_hz) * 1000.0;
+    info.src_w = scale_src_w.load();
+    info.src_h = scale_src_h.load();
+    info.dst_w = scale_dst_w.load();
+    info.dst_h = scale_dst_h.load();
+    info.upscaler = scale_kind.load();
+    info.sharpening = qRound(sharpen_strength.load() * 100.0f);
     return info;
 }
 
@@ -8023,11 +8033,30 @@ void QmlMainWindow::render()
             fsrcnnx_hook = select_spatial_hook(video_preset, configured_upscaler, upscale_factor,
                                                fsr_hook, fsrcnnx_hook_8, fsrcnnx_hook_16);
         }
+        scale_src_w.store(qRound(src_width));
+        scale_src_h.store(qRound(src_height));
+        scale_dst_w.store(qRound(dst_width));
+        scale_dst_h.store(qRound(dst_height));
+        scale_kind.store(!fsrcnnx_hook ? 0 : (fsrcnnx_hook == fsr_hook ? 1 : (fsrcnnx_hook == fsrcnnx_hook_8 ? 2 : 3)));
     }
-    const struct pl_hook *active_hooks[] = {fsrcnnx_hook};
-    if (fsrcnnx_hook) {
+    // Sharpening runs after scaling, at the final size, also for generated frames.
+    const float sharpen = stream_active ? sharpen_strength.load() : 0.0f;
+    const struct pl_hook *active_hooks[2] = {};
+    int num_active_hooks = 0;
+    if (fsrcnnx_hook)
+        active_hooks[num_active_hooks++] = fsrcnnx_hook;
+    if (sharpen_hook && sharpen > 0.001f) {
+        for (int i = 0; i < sharpen_hook->num_parameters; i++) {
+            if (sharpen_hook->parameters[i].data && strcmp(sharpen_hook->parameters[i].name, "sharpness") == 0)
+                sharpen_hook->parameters[i].data->f = qBound(0.0f, sharpen, 1.0f);
+        }
+        active_hooks[num_active_hooks++] = sharpen_hook;
+    }
+    if (num_active_hooks > 0) {
         params.hooks = active_hooks;
-        params.num_hooks = 1;
+        params.num_hooks = num_active_hooks;
+    }
+    if (fsrcnnx_hook) {
         switch (video_preset) {
         case VideoPreset::HighQualitySpatial:
             if (fsrcnnx_hook == fsr_hook)

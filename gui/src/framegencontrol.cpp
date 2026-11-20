@@ -133,6 +133,46 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	tune_layout->addRow(on_top_box);
 	root->addWidget(tune_group);
 
+	// Picture quality: scaler preset (the same setting as in the video
+	// settings) and sharpening.
+	auto *quality_group = new QGroupBox(tr("Bildqualität"));
+	auto *quality_layout = new QFormLayout(quality_group);
+	scaler_box = new QComboBox;
+	scaler_box->addItem(tr("Schnell"));
+	scaler_box->addItem(tr("Standard"));
+	scaler_box->addItem(tr("Hohe Qualität"));
+	scaler_box->addItem(tr("KI-Hochskalierung (FSRCNNX)"));
+	scaler_box->addItem(tr("KI-Hochskalierung stark (FSRCNNX 16)"));
+	scaler_box->addItem(tr("Eigene Einstellungen"));
+	auto *scaler_label = new QLabel(tr("Hochskalierung:"));
+	scaler_label->setToolTip(tr("Wie das 1080p-Bild auf deinen Bildschirm vergrößert wird. Die "
+	                            "KI-Hochskalierung rekonstruiert feine Details und wirkt deutlich schärfer, "
+	                            "greift aber nur, wenn das Fenster größer als der Stream ist (z. B. 1440p- "
+	                            "oder 4K-Monitor). „Stark“ braucht viel mehr Grafikleistung."));
+	scaler_box->setToolTip(scaler_label->toolTip());
+	quality_layout->addRow(scaler_label, scaler_box);
+
+	sharpen_slider = new QSlider(Qt::Horizontal);
+	sharpen_slider->setRange(0, 100);
+	sharpen_slider->setSingleStep(5);
+	sharpen_slider->setPageStep(10);
+	sharpen_value = new QLabel;
+	sharpen_value->setMinimumWidth(48);
+	auto *sharpen_row = new QHBoxLayout;
+	sharpen_row->addWidget(sharpen_slider);
+	sharpen_row->addWidget(sharpen_value);
+	auto *sharpen_label = new QLabel(tr("Schärfe:"));
+	sharpen_label->setToolTip(tr("Kontrast-adaptive Schärfung nach dem Vergrößern: holt feine Details "
+	                             "aus dem Stream, ohne helle Ränder an Kanten. Wirkt auch bei 1080p. "
+	                             "Zu viel macht Kompressionsartefakte sichtbarer. 0 % = aus."));
+	sharpen_slider->setToolTip(sharpen_label->toolTip());
+	quality_layout->addRow(sharpen_label, sharpen_row);
+
+	picture_label = new QLabel(QStringLiteral("–"));
+	picture_label->setWordWrap(true);
+	quality_layout->addRow(tr("Bild:"), picture_label);
+	root->addWidget(quality_group);
+
 	// Live values
 	auto *live_group = new QGroupBox(tr("Live"));
 	auto *live_layout = new QFormLayout(live_group);
@@ -189,6 +229,19 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 		if (!syncing)
 			this->settings->setFrameGenerationThreshold(value);
 	});
+	connect(scaler_box, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+		if (syncing || index < 0 || index > 5)
+			return;
+		this->settings->setVideoPreset(index);
+		if (this->window)
+			this->window->setVideoPreset(static_cast<QmlMainWindow::VideoPreset>(index));
+	});
+	connect(sharpen_slider, &QSlider::valueChanged, this, [this](int value) {
+		sharpen_value->setText(value > 0 ? tr("%1 %").arg(value) : tr("aus"));
+		if (!syncing)
+			this->settings->setSharpening(value);
+	});
+	connect(settings, &QmlSettings::videoPresetChanged, this, &FrameGenControlWindow::syncFromSettings);
 	connect(marker_box, &QCheckBox::toggled, this, [this](bool on) {
 		if (!syncing)
 			this->settings->setFrameGenerationMarker(on);
@@ -231,6 +284,9 @@ void FrameGenControlWindow::syncFromSettings()
 	threshold_slider->setValue(settings->frameGenerationThreshold());
 	threshold_value->setText(QString::number(threshold_slider->value() / 10.0, 'f', 1));
 	marker_box->setChecked(settings->frameGenerationMarker());
+	scaler_box->setCurrentIndex(qBound(0, settings->videoPreset(), 5));
+	sharpen_slider->setValue(settings->sharpening());
+	sharpen_value->setText(sharpen_slider->value() > 0 ? tr("%1 %").arg(sharpen_slider->value()) : tr("aus"));
 	syncing = false;
 }
 
@@ -268,6 +324,22 @@ void FrameGenControlWindow::refreshStats()
 	const double dispatch_ms = pace_renders ? delta(info.pacer_dispatch_us, last_info.pacer_dispatch_us) / 1000.0 / pace_renders : 0.0;
 
 	mode_box->setItemText(3, tr("Bildschirmrate (%1 Hz)").arg(qRound(info.display_hz)));
+
+	if (info.src_w > 0 && info.dst_w > 0) {
+		static const char *const scalers[] = {
+			QT_TR_NOOP("Standard-Skalierung"), QT_TR_NOOP("FSR"),
+			QT_TR_NOOP("KI-Hochskalierung (FSRCNNX)"), QT_TR_NOOP("KI-Hochskalierung stark (FSRCNNX 16)")
+		};
+		QString text;
+		if (info.dst_w > info.src_w + 8 || info.dst_h > info.src_h + 8)
+			text = tr("%1×%2 → %3×%4, %5").arg(info.src_w).arg(info.src_h).arg(info.dst_w).arg(info.dst_h)
+			       .arg(tr(scalers[qBound(0, info.upscaler, 3)]));
+		else
+			text = tr("%1×%2 ohne Vergrößerung (Fenster nicht größer als der Stream)").arg(info.src_w).arg(info.src_h);
+		if (info.sharpening > 0)
+			text += tr(", Schärfe %1 %").arg(info.sharpening);
+		picture_label->setText(text);
+	}
 
 	const bool sampled = dt > 0.0;
 	QString status;

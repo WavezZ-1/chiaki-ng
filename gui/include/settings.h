@@ -535,6 +535,9 @@ class Settings : public QObject
 		void SetFrameGenerationDamping(int percent) { settings.setValue("settings/frame_generation_acceleration", qBound(0, percent, 100)); }
 		// Share of the possible delay used for interpolation: 0 = predict only (no
 		// delay), 100 = in-between frames only (cleanest, most delay).
+		// Contrast adaptive sharpening after scaling, 0 = off, 1..100 = light..strong.
+		int GetSharpening() const { return qBound(0, settings.value("settings/sharpening", 30).toInt(), 100); }
+		void SetSharpening(int percent) { settings.setValue("settings/sharpening", qBound(0, percent, 100)); }
 		int GetFrameGenerationDelay() const { return qBound(0, settings.value("settings/frame_generation_delay", 100).toInt(), 100); }
 		void SetFrameGenerationDelay(int percent) { settings.setValue("settings/frame_generation_delay", qBound(0, percent, 100)); }
 		bool GetFrameGenerationMarker() const { return settings.value("settings/frame_generation_marker", false).toBool(); }

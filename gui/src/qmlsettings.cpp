@@ -1045,6 +1045,20 @@ void QmlSettings::setFrameGenerationDamping(int percent)
     emit placeboChanged();
 }
 
+int QmlSettings::sharpening() const
+{
+    return settings->GetSharpening();
+}
+
+void QmlSettings::setSharpening(int percent)
+{
+    if (percent == settings->GetSharpening())
+        return;
+    settings->SetSharpening(percent);
+    emit frameGenerationChanged();
+    emit placeboChanged();
+}
+
 int QmlSettings::frameGenerationDelay() const
 {
     return settings->GetFrameGenerationDelay();

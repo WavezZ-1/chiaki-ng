@@ -562,12 +562,36 @@ const char *kInterpBody = R"(
     color = vec4(m, w, 0.0);
 )";
 
+// How far the content has moved from the previous frame at time t. Straight
+// motion gives t * m. With the motion of the frame pair before (d0) the path is
+// a parabola through three frames instead, so a camera that speeds up, slows
+// down or turns round is placed where it really is in between. With r = this
+// pair's duration / the previous pair's (in game frames):
+//   s = t * m - t (1 - t) * r / (1 + r) * (m - r * d0)
+// (r = 1: s = t * m - t (1 - t) / 2 * (m - d0)). d0 is only trusted if it is
+// plausible for the same content.
+const char *kAccelBody = R"(
+    ivec2 pos = ivec2(gl_FragCoord.xy);
+    vec4 r = texelFetch(fg_mv, pos, 0);
+    vec2 m = r.xy;
+    vec2 s = fg_t * m;
+    if (fg_accel > 0.001) {
+        ivec2 mx = textureSize(fg_prevmv, 0) - 1;
+        vec4 d0 = texelFetch(fg_prevmv, clamp(ivec2(floor(vec2(pos) - s + 0.5)), ivec2(0), mx), 0);
+        vec2 a = m - fg_ratio * d0.xy;
+        if (!fg_bad(d0) && length(a) <= 0.5 * max(length(m), fg_ratio * length(d0.xy)) + 2.0)
+            s -= fg_accel * fg_t * (1.0 - fg_t) * (fg_ratio / (1.0 + fg_ratio)) * a;
+    }
+    color = vec4(s, 0.0, 0.0);
+)";
+
 const char *kBlendBody = R"(
     vec2 pc = gl_FragCoord.xy;
     vec4 mv = texture(fg_mv, pc / fg_size);
     vec2 m = mv.xy * fg_mv_scale;
-    vec2 ua = (pc - fg_t * m) / fg_size;
-    vec2 ub = (pc + (1.0 - fg_t) * m) / fg_size;
+    vec2 sp = texture(fg_s, pc / fg_size).xy * fg_mv_scale;
+    vec2 ua = (pc - sp) / fg_size;
+    vec2 ub = (pc - sp + m) / fg_size;
 #if FG_BICUBIC
     vec4 a = fg_catmull(fg_prev, ua, fg_size);
     vec4 b = fg_catmull(fg_cur, ub, fg_size);
@@ -576,8 +600,8 @@ const char *kBlendBody = R"(
     vec4 b = texture(fg_cur, ub);
 #endif
     // Content entering at the frame edge exists in only one of the frames.
-    vec2 pa = pc - fg_t * m;
-    vec2 pb = pc + (1.0 - fg_t) * m;
+    vec2 pa = pc - sp;
+    vec2 pb = pc - sp + m;
     bool aout = any(lessThan(pa, vec2(0.0))) || any(greaterThan(pa, fg_size));
     bool bout = any(lessThan(pb, vec2(0.0))) || any(greaterThan(pb, fg_size));
     float w = mv.z;
@@ -679,6 +703,7 @@ void FrameGenerator::releaseResources()
 	pl_tex_destroy(gpu, &mv_final);
 	pl_tex_destroy(gpu, &mvb_final);
 	pl_tex_destroy(gpu, &tile_tex);
+	pl_tex_destroy(gpu, &path_tex);
 	pl_tex_destroy(gpu, &global_tex);
 	pl_tex_destroy(gpu, &mv_prev_final);
 	pl_tex_destroy(gpu, &mv_proj);
@@ -811,6 +836,7 @@ bool FrameGenerator::ensureResources(const struct pl_frame *src)
 		ok = ok && (mvb_level[l] = make(lw[l], lh[l], fmt_mv, false));
 	ok = ok && (mvb_final = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (tile_tex = make(16, 9, fmt_mv, false));
+	ok = ok && (path_tex = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (global_tex = make(1, 1, fmt_mv, false));
 	ok = ok && (mv_final = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (mv_proj = make(lw[0], lh[0], fmt_mv, false));
@@ -989,6 +1015,17 @@ bool FrameGenerator::interpPass(float t, pl_tex dst)
 	               dst, timers[kTimerInterp]);
 }
 
+bool FrameGenerator::accelPass(float t, pl_tex mv, pl_tex dst)
+{
+	float accel = prev_motion_valid ? damping : 0.0f;
+	float ratio = static_cast<float>(pair_frames) / static_cast<float>(std::max(1, prev_pair_frames));
+	return runPass(dispatch, "framegen path", reliabilityHeader(), kAccelBody,
+	               { { "fg_mv", mv, false }, { "fg_prevmv", mv_prev_final, false } },
+	               { { pl_var_float("fg_t"), &t }, { pl_var_float("fg_accel"), &accel },
+	                 { pl_var_float("fg_ratio"), &ratio } },
+	               dst, timers[kTimerAccel]);
+}
+
 bool FrameGenerator::blendPass(pl_tex prev, pl_tex cur, pl_tex mv, pl_tex dst, float fx, float fy, float t, bool bicubic, int plane)
 {
 	const std::string header = std::string(bicubic ? "#define FG_BICUBIC 1\n" : "#define FG_BICUBIC 0\n") + kWarpHeader;
@@ -1002,7 +1039,8 @@ bool FrameGenerator::blendPass(pl_tex prev, pl_tex cur, pl_tex mv, pl_tex dst, f
 		marker[2] = bicubic ? 0.92f : 0.5f;
 	}
 	return runPass(dispatch, "framegen blend", header, kBlendBody,
-	               { { "fg_prev", prev, true }, { "fg_cur", cur, true }, { "fg_mv", mv, false } },
+	               { { "fg_prev", prev, true }, { "fg_cur", cur, true }, { "fg_mv", mv, false },
+	                 { "fg_s", path_tex, false } },
 	               { { pl_var_vec2("fg_size"), size }, { pl_var_vec2("fg_mv_scale"), scale },
 	                 { pl_var_float("fg_t"), &t }, { pl_var_vec3("fg_marker"), marker } },
 	               dst, timers[kTimerBlend + plane]);
@@ -1109,6 +1147,11 @@ bool FrameGenerator::estimateMotion()
 	// pair of game frames only if it was estimated for exactly that pair.
 	std::swap(mv_final, mv_prev_final);
 	prev_motion_valid = have_motion_pts && std::fabs(motion_cur_pts - p.pts) < 1e-6;
+	// How many game frames each pair spans (a frame taken for a repeat makes it 2).
+	prev_pair_frames = pair_frames;
+	pair_frames = frame_interval > 0.0
+	    ? std::max(1, static_cast<int>(std::lround((c.pts - p.pts) / frame_interval)))
+	    : 1;
 	// mv_proj is only needed later in generate(), so it serves as scratch here.
 	const bool ok = checkPass(mv_level[0], mvb_level[1], mv_proj)
 	             && fillPass(mv_proj, mv_level[0])
@@ -1174,7 +1217,7 @@ bool FrameGenerator::interpolate(const struct pl_frame *meta, float t, pl_tex ou
 		}
 	}
 	t = std::min(1.0f, std::max(0.0f, t));
-	if (!interpPass(t, mv_proj)) {
+	if (!interpPass(t, mv_proj) || !accelPass(t, mv_proj, path_tex)) {
 		recordFailure();
 		return false;
 	}
