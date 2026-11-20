@@ -9,6 +9,10 @@
 // future frame, so real frames are shown exactly as early as before; only the
 // repeated slots are swapped for predicted ones.
 //
+// For display-rate output it can also interpolate between the two newest real
+// frames instead (interpolate()), which is far cleaner on fast or sudden
+// motion but has to be shown later than the newest frame arrived.
+//
 // The generator works on the decoded YCbCr planes, so the output goes through
 // exactly the same rendering path (scaler, upscaling shaders, tone mapping) as
 // the real frames.
@@ -88,6 +92,13 @@ public:
 	// colour metadata (the last mapped frame); its textures are not used.
 	bool predict(const struct pl_frame *meta, float factor, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out);
 
+	// Interpolates between the two newest real frames: t = 0 is the previous
+	// game frame, t = 1 the newest one. Unlike predict() this needs no guess
+	// about the future, so fast or sudden motion comes out much cleaner, but
+	// the caller has to show the result later than the newest frame arrived.
+	// Available whenever canPredict() is true.
+	bool interpolate(const struct pl_frame *meta, float t, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out);
+
 	// Average time between two game frames in seconds (from the pts of new
 	// frames), or 0 if not known yet.
 	double gameFrameInterval() const { return frame_interval; }
@@ -132,7 +143,16 @@ private:
 		kTimerSmooth,
 		kTimerProject,
 		kTimerWarp,                                // + plane
-		kTimerCount = kTimerWarp + PL_MAX_PLANES
+		kTimerCheckBack = kTimerWarp + PL_MAX_PLANES,
+		kTimerFillBack,
+		kTimerSmoothBack,
+		kTimerInterp,
+		kTimerBlend,                               // + plane
+		kTimerTiles = kTimerBlend + PL_MAX_PLANES,
+		kTimerGlobal,
+		kTimerTilesBack,
+		kTimerGlobalBack,
+		kTimerCount
 	};
 
 	struct Slot
@@ -164,9 +184,11 @@ private:
 	bool copyPass(pl_tex src, pl_tex dst, int plane);
 	bool diffPass(pl_tex a, pl_tex b, pl_tex dst);
 	bool searchPass(pl_tex cur, pl_tex prev, pl_tex parent, pl_tex dst, int level, int radius, int patch, bool subpixel);
-	bool smoothPass(pl_tex src, pl_tex dst);
-	bool checkPass(pl_tex fwd, pl_tex bwd, pl_tex dst);
-	bool fillPass(pl_tex src, pl_tex dst);
+	bool smoothPass(pl_tex src, pl_tex dst, int timer = kTimerSmooth);
+	bool checkPass(pl_tex fwd, pl_tex bwd, pl_tex dst, int timer = kTimerCheck);
+	bool fillPass(pl_tex src, pl_tex dst, int timer = kTimerFill);
+	bool interpPass(float t, pl_tex dst);
+	bool blendPass(pl_tex prev, pl_tex cur, pl_tex mv, pl_tex dst, float fx, float fy, float t, bool bicubic, int plane);
 	bool projectPass(pl_tex mv, pl_tex dst, float factor);
 	bool warpPass(pl_tex src, pl_tex mv, pl_tex dst, float fx, float fy, bool bicubic, int plane);
 	void collectTimers();
@@ -174,6 +196,8 @@ private:
 	bool readDiffMetric(float *metric);
 	void recordFailure();
 	bool estimateMotion();
+	bool estimateBackward();
+	void finishOutput(const struct pl_frame *src, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out) const;
 	bool generate(const struct pl_frame *src, float factor, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out);
 
 	std::function<void(const char *)> logger;
@@ -189,8 +213,11 @@ private:
 	Layout layout;
 	std::array<Slot, kSlots> history;
 	std::array<pl_tex, kLevels> mv_level{};
-	std::array<pl_tex, kLevels> mvb_level{}; // backward motion, levels 1..4
+	std::array<pl_tex, kLevels> mvb_level{}; // backward motion (previous -> current)
 	pl_tex mv_final = nullptr;
+	pl_tex mvb_final = nullptr;     // backward motion at full detail, for interpolation
+	pl_tex tile_tex = nullptr;      // dominant motion per tile (16x9)
+	pl_tex global_tex = nullptr;    // dominant motion of the whole picture (1x1)
 	pl_tex mv_proj = nullptr;
 	pl_tex mv_prev_final = nullptr; // motion of the previous pair of game frames
 	pl_tex diff_tex = nullptr;
@@ -209,8 +236,10 @@ private:
 	int dups_since_unique = 0;
 	double cadence = 1.0;
 	double frame_interval = 0.0;
+	int long_gaps = 0;
 	bool motion_pending = false;
 	bool motion_valid = false;
+	bool backward_valid = false;
 	float dup_threshold_levels = 2.0f;
 	bool show_marker = false;
 	float damping = 1.0f;

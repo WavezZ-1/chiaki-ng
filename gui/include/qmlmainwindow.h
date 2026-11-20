@@ -63,6 +63,7 @@ struct FrameGenerationInfo
     double target_hz = 0.0;      // output rate in display-rate modes (0 in 60 fps mode)
     bool direct_mapping = true;  // display-rate modes need direct frame mapping
     bool paced = false;          // display-rate mode is in effect
+    double delay_ms = 0.0;       // how much later than the newest real frame pictures are shown
     bool created = false;
     bool supported = true;
     quint64 video_presents = 0;  // video frames rendered so far
@@ -332,6 +333,7 @@ private:
     std::atomic<float> fg_max_prediction{0.9f};
     std::atomic<float> fg_threshold{2.0f};
     std::atomic<float> fg_damping{1.0f};
+    std::atomic<float> fg_delay{1.0f};
     QAtomicInteger<int> fg_marker = 0;
     std::atomic<double> fg_display_hz{60.0};
     QAtomicInteger<quint64> fg_video_presents = 0;
@@ -361,6 +363,8 @@ private:
     // Returns true when the render has nothing new to show and can skip presenting.
     bool handleDirectFrameGeneration(bool new_mapping, qint64 now_us);
     void armFrameGenPacer(qint64 now_us, double min_next_tick = 1.0);
+    double frameGenerationDelaySeconds(double interval, double target_hz) const;
+    bool showFrameGenerationTick(FrameGenerator *fg, double tick, double target_hz);
     uint64_t ts_start = 0;
     double queue_pts_origin = -1.0;
     double newest_queued_frame_pts = -1.0;

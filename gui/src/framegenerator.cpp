@@ -255,9 +255,66 @@ const char *kCheckBody = R"(
     color = (outside || e > fg_tol + 0.15 * length(f.xy)) ? vec4(f.xy, 1.0, f.w) : f;
 )";
 
+// Dominant ("background") motion of a field, in two steps: the most common
+// reliable vector of each of 16x9 tiles (8x8 samples each), then the most
+// common of those, weighted by how many samples agreed. Stays on the GPU.
+const char *kTileBody = R"(
+    ivec2 tile = ivec2(gl_FragCoord.xy);
+    ivec2 size = textureSize(fg_mv, 0);
+    vec2 stp = vec2(size) / vec2(16.0 * 8.0, 9.0 * 8.0);
+    vec2 origin = vec2(tile) * 8.0 * stp + 0.5 * stp;
+    float best_n = 0.0;
+    vec2 best = vec2(0.0);
+    for (int i = 0; i < 64; i++) {
+        vec4 a = texelFetch(fg_mv, ivec2(origin + vec2(float(i & 7), float(i >> 3)) * stp), 0);
+        if (fg_bad(a))
+            continue;
+        float tol = 1.5 + 0.05 * length(a.xy);
+        float n = 0.0;
+        for (int j = 0; j < 64; j++) {
+            vec4 b = texelFetch(fg_mv, ivec2(origin + vec2(float(j & 7), float(j >> 3)) * stp), 0);
+            if (!fg_bad(b) && length(a.xy - b.xy) < tol)
+                n += 1.0;
+        }
+        if (n > best_n) {
+            best_n = n;
+            best = a.xy;
+        }
+    }
+    color = vec4(best, best_n, 0.0);
+)";
+
+const char *kGlobalBody = R"(
+    float best_n = -1.0;
+    vec2 best = vec2(0.0);
+    for (int i = 0; i < 144; i++) {
+        vec4 a = texelFetch(fg_tiles, ivec2(i % 16, i / 16), 0);
+        if (a.z <= 0.0)
+            continue;
+        float tol = 2.0 + 0.1 * length(a.xy);
+        float n = 0.0;
+        for (int j = 0; j < 144; j++) {
+            vec4 b = texelFetch(fg_tiles, ivec2(j % 16, j / 16), 0);
+            if (length(a.xy - b.xy) < tol)
+                n += b.z;
+        }
+        if (n > best_n) {
+            best_n = n;
+            best = a.xy;
+        }
+    }
+    color = vec4(best, best_n, 0.0);
+)";
+
 // Unreliable vectors take the vector of the nearest reliable neighbour (rings
-// of 2, 4, 8 and 16 pixels) and are marked as filled (cost -1.0), so later
+// of 2, 4, 8, 16 and 32 pixels) and are marked as filled (cost -1.0), so later
 // passes still know they were not matched.
+//
+// Most wide unreliable areas are content without a counterpart in the other
+// frame because a moving object covered it there. That content is background,
+// so in gaps at least 8 pixels wide a neighbour moving with the dominant
+// (background) motion, found within twice the distance of the nearest one,
+// wins over an object vector next to the gap.
 const char *kFillBody = R"(
     ivec2 pos = ivec2(gl_FragCoord.xy);
     ivec2 mx = textureSize(fg_mv, 0) - 1;
@@ -265,26 +322,46 @@ const char *kFillBody = R"(
     if (!fg_bad(c)) {
         color = c;
     } else {
+        vec2 g = texelFetch(fg_global, ivec2(0), 0).xy;
+        float gtol = 2.0 + 0.15 * length(g);
         ivec2 dirs[8];
         dirs[0] = ivec2(1, 0);   dirs[1] = ivec2(-1, 0);
         dirs[2] = ivec2(0, 1);   dirs[3] = ivec2(0, -1);
         dirs[4] = ivec2(1, 1);   dirs[5] = ivec2(-1, 1);
         dirs[6] = ivec2(1, -1);  dirs[7] = ivec2(-1, -1);
-        vec4 best = c;
-        float bestz = 1e9;
-        for (int r = 1; r <= 4; r++) {
+        vec4 near = c;
+        float nearz = 1e9;
+        vec4 bg = c;
+        float bgz = 1e9;
+        int first = 0;
+        for (int r = 1; r <= 5; r++) {
+            if (first > 0 && r > first + 1)
+                break;
             int dist = 1 << r;
             for (int k = 0; k < 8; k++) {
                 vec4 s = texelFetch(fg_mv, clamp(pos + dirs[k] * dist, ivec2(0), mx), 0);
-                if (!fg_bad(s) && s.z < bestz) {
-                    bestz = s.z;
-                    best = s;
+                if (fg_bad(s))
+                    continue;
+                if (first == 0 || r == first) {
+                    if (s.z < nearz) {
+                        nearz = s.z;
+                        near = s;
+                    }
+                }
+                // Only gaps at least 8 pixels wide are treated as occlusions;
+                // narrower ones are mostly unmatched edges of the object itself.
+                if (r >= 3 && length(s.xy - g) < gtol && s.z < bgz) {
+                    bgz = s.z;
+                    bg = s;
                 }
             }
-            if (bestz < 1e8)
+            if (first == 0 && nearz < 1e8)
+                first = r;
+            if (bgz < 1e8)
                 break;
         }
-        color = bestz < 1e8 ? vec4(best.xy, -1.0, c.w) : c;
+        vec4 pick = bgz < 1e8 ? bg : near;
+        color = (bgz < 1e8 || nearz < 1e8) ? vec4(pick.xy, -1.0, c.w) : c;
     }
 )";
 
@@ -402,6 +479,117 @@ const char *kWarpBody = R"(
         color = vec4(fg_marker.z);
 )";
 
+// Interpolation between the previous (t = 0) and the newest (t = 1) game frame.
+// Motion is m = displacement from the previous to the newest frame, so content
+// that is at y at time t comes from prev(y - t m) and cur(y + (1 - t) m).
+//
+// fg_arrive() projects one motion field to time t: it finds the vector v whose
+// pixel at y + s * v really moves with v, i.e. the content passing through y.
+// Returns (v, consistency error, 1 if that pixel was actually matched in the
+// other frame, 0 if it has no counterpart there).
+const char *kInterpHeader = R"(
+vec4 fg_arrive(sampler2D m, vec2 y, float s, ivec2 mx)
+{
+    ivec2 pos = ivec2(y);
+    vec4 cands[11];
+    for (int j = 0; j < 3; j++) {
+        for (int i = 0; i < 3; i++)
+            cands[j * 3 + i] = texelFetch(m, clamp(pos + ivec2(i - 1, j - 1) * 2, ivec2(0), mx), 0);
+    }
+    vec4 s1 = texelFetch(m, clamp(ivec2(floor(y + s * cands[4].xy + 0.5)), ivec2(0), mx), 0);
+    cands[9] = s1;
+    cands[10] = texelFetch(m, clamp(ivec2(floor(y + s * s1.xy + 0.5)), ivec2(0), mx), 0);
+    float best_e = 1e9;
+    vec4 best = cands[4];
+    vec4 best_src = s1;
+    for (int k = 0; k < 11; k++) {
+        vec4 c = cands[k];
+        vec4 sv = texelFetch(m, clamp(ivec2(floor(y + s * c.xy + 0.5)), ivec2(0), mx), 0);
+        float e = length(sv.xy - c.xy);
+        if (e < best_e - 0.05 || (e < best_e + 0.05 && fg_cost(sv) < fg_cost(best_src))) {
+            best_e = min(e, best_e);
+            best = c;
+            best_src = sv;
+        }
+    }
+    return vec4(best.xy, best_e, fg_bad(best_src) ? 0.0 : 1.0);
+}
+
+// Mean luma difference of the two frames along the motion path (4 taps).
+float fg_photo(sampler2D pl, sampler2D cl, vec2 y, vec2 m, float t, vec2 pt)
+{
+    float acc = 0.0;
+    for (int k = 0; k < 4; k++) {
+        vec2 q = y + 0.5 + vec2(float(k & 1), float(k >> 1)) * 2.0 - 1.0;
+        acc += abs(texture(pl, (q - t * m) * pt).r - texture(cl, (q + (1.0 - t) * m) * pt).r);
+    }
+    return acc * 0.25;
+}
+)";
+
+// Output: (m, weight of the newest frame, 0). Content visible in only one of
+// the two frames (uncovered behind or covered in front of a moving object) is
+// taken from that frame alone; elsewhere both are blended by time.
+const char *kInterpBody = R"(
+    ivec2 pos = ivec2(gl_FragCoord.xy);
+    ivec2 mx = textureSize(fg_mvf, 0) - 1;
+    vec2 y = vec2(pos);
+    vec4 f = fg_arrive(fg_mvf, y, 1.0 - fg_t, mx);
+    vec4 b = fg_arrive(fg_mvb, y, fg_t, mx);
+    vec2 mf = f.xy;
+    vec2 mb = -b.xy;
+    bool fok = f.z <= fg_tol;
+    bool bok = b.z <= fg_tol;
+    bool fgood = fok && f.w > 0.5;
+    bool bgood = bok && b.w > 0.5;
+    float pf = fg_photo(fg_prevl, fg_curl, y, mf, fg_t, fg_pt);
+    float pb = fg_photo(fg_prevl, fg_curl, y, mb, fg_t, fg_pt);
+    vec2 m;
+    float w = fg_t;
+    if (fok && !fgood && !bgood) {
+        m = mf; w = 1.0;                   // uncovered: only in the newest frame
+    } else if (bok && !bgood && !fgood) {
+        m = mb; w = 0.0;                   // being covered: only in the previous frame
+    } else if (fgood && bgood) {
+        m = pf <= pb ? mf : mb;
+    } else if (fgood) {
+        m = mf;
+    } else if (bgood) {
+        m = mb;
+    } else {
+        m = pf <= pb ? mf : mb;
+    }
+    color = vec4(m, w, 0.0);
+)";
+
+const char *kBlendBody = R"(
+    vec2 pc = gl_FragCoord.xy;
+    vec4 mv = texture(fg_mv, pc / fg_size);
+    vec2 m = mv.xy * fg_mv_scale;
+    vec2 ua = (pc - fg_t * m) / fg_size;
+    vec2 ub = (pc + (1.0 - fg_t) * m) / fg_size;
+#if FG_BICUBIC
+    vec4 a = fg_catmull(fg_prev, ua, fg_size);
+    vec4 b = fg_catmull(fg_cur, ub, fg_size);
+#else
+    vec4 a = texture(fg_prev, ua);
+    vec4 b = texture(fg_cur, ub);
+#endif
+    // Content entering at the frame edge exists in only one of the frames.
+    vec2 pa = pc - fg_t * m;
+    vec2 pb = pc + (1.0 - fg_t) * m;
+    bool aout = any(lessThan(pa, vec2(0.0))) || any(greaterThan(pa, fg_size));
+    bool bout = any(lessThan(pb, vec2(0.0))) || any(greaterThan(pb, fg_size));
+    float w = mv.z;
+    if (aout && !bout)
+        w = 1.0;
+    else if (bout && !aout)
+        w = 0.0;
+    color = clamp(mix(a, b, w), 0.0, 1.0);
+    if (pc.x < fg_marker.x && pc.y < fg_marker.y)
+        color = vec4(fg_marker.z);
+)";
+
 } // namespace
 
 void FrameGenerator::warn(const char *msg) const
@@ -489,6 +677,9 @@ void FrameGenerator::releaseResources()
 	for (auto &t : mvb_level)
 		pl_tex_destroy(gpu, &t);
 	pl_tex_destroy(gpu, &mv_final);
+	pl_tex_destroy(gpu, &mvb_final);
+	pl_tex_destroy(gpu, &tile_tex);
+	pl_tex_destroy(gpu, &global_tex);
 	pl_tex_destroy(gpu, &mv_prev_final);
 	pl_tex_destroy(gpu, &mv_proj);
 	pl_tex_destroy(gpu, &diff_tex);
@@ -507,8 +698,10 @@ void FrameGenerator::resetState()
 	dups_since_unique = 0;
 	cadence = 1.0;
 	frame_interval = 0.0;
+	long_gaps = 0;
 	motion_pending = false;
 	motion_valid = false;
+	backward_valid = false;
 	prev_motion_valid = false;
 	have_motion_pts = false;
 	stat_cadence.store(cadence);
@@ -614,8 +807,11 @@ bool FrameGenerator::ensureResources(const struct pl_frame *src)
 	}
 	for (int l = 0; l < kLevels; l++)
 		ok = ok && (mv_level[l] = make(lw[l], lh[l], fmt_mv, false));
-	for (int l = 1; l < kLevels; l++)
+	for (int l = 0; l < kLevels; l++)
 		ok = ok && (mvb_level[l] = make(lw[l], lh[l], fmt_mv, false));
+	ok = ok && (mvb_final = make(lw[0], lh[0], fmt_mv, false));
+	ok = ok && (tile_tex = make(16, 9, fmt_mv, false));
+	ok = ok && (global_tex = make(1, 1, fmt_mv, false));
 	ok = ok && (mv_final = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (mv_proj = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (mv_prev_final = make(lw[0], lh[0], fmt_mv, false));
@@ -744,10 +940,10 @@ bool FrameGenerator::searchPass(pl_tex cur, pl_tex prev, pl_tex parent, pl_tex d
 	               dst, timer);
 }
 
-bool FrameGenerator::smoothPass(pl_tex src, pl_tex dst)
+bool FrameGenerator::smoothPass(pl_tex src, pl_tex dst, int timer)
 {
 	return runPass(dispatch, "framegen smooth", std::string(), kSmoothBody,
-	               { { "fg_src", src, false } }, {}, dst, timers[kTimerSmooth]);
+	               { { "fg_src", src, false } }, {}, dst, timers[timer]);
 }
 
 static std::string reliabilityHeader()
@@ -757,19 +953,59 @@ static std::string reliabilityHeader()
 	return std::string(defs) + kReliabilityHeader;
 }
 
-bool FrameGenerator::checkPass(pl_tex fwd, pl_tex bwd, pl_tex dst)
+bool FrameGenerator::checkPass(pl_tex fwd, pl_tex bwd, pl_tex dst, int timer)
 {
 	float tol = 2.5f;
 	return runPass(dispatch, "framegen check", std::string(), kCheckBody,
 	               { { "fg_fwd", fwd, false }, { "fg_bwd", bwd, false } },
 	               { { pl_var_float("fg_tol"), &tol } },
-	               dst, timers[kTimerCheck]);
+	               dst, timers[timer]);
 }
 
-bool FrameGenerator::fillPass(pl_tex src, pl_tex dst)
+bool FrameGenerator::fillPass(pl_tex src, pl_tex dst, int timer)
 {
+	// Dominant motion of `src` first (tiles, then one texel).
+	const bool backward = timer == kTimerFillBack;
+	if (!runPass(dispatch, "framegen tiles", reliabilityHeader(), kTileBody,
+	             { { "fg_mv", src, false } }, {}, tile_tex, timers[backward ? kTimerTilesBack : kTimerTiles])
+	    || !runPass(dispatch, "framegen global", std::string(), kGlobalBody,
+	                { { "fg_tiles", tile_tex, false } }, {}, global_tex, timers[backward ? kTimerGlobalBack : kTimerGlobal]))
+		return false;
 	return runPass(dispatch, "framegen fill", reliabilityHeader(), kFillBody,
-	               { { "fg_mv", src, false } }, {}, dst, timers[kTimerFill]);
+	               { { "fg_mv", src, false }, { "fg_global", global_tex, false } }, {}, dst, timers[timer]);
+}
+
+bool FrameGenerator::interpPass(float t, pl_tex dst)
+{
+	const Slot &c = history[cur_slot];
+	const Slot &p = history[prev_slot];
+	float tol = 1.0f;
+	float pt[2] = { 1.0f / c.pyramid[0]->params.w, 1.0f / c.pyramid[0]->params.h };
+	return runPass(dispatch, "framegen interpolate", reliabilityHeader() + kInterpHeader, kInterpBody,
+	               { { "fg_mvf", mv_final, false }, { "fg_mvb", mvb_final, false },
+	                 { "fg_prevl", p.pyramid[0], true }, { "fg_curl", c.pyramid[0], true } },
+	               { { pl_var_float("fg_t"), &t }, { pl_var_float("fg_tol"), &tol },
+	                 { pl_var_vec2("fg_pt"), pt } },
+	               dst, timers[kTimerInterp]);
+}
+
+bool FrameGenerator::blendPass(pl_tex prev, pl_tex cur, pl_tex mv, pl_tex dst, float fx, float fy, float t, bool bicubic, int plane)
+{
+	const std::string header = std::string(bicubic ? "#define FG_BICUBIC 1\n" : "#define FG_BICUBIC 0\n") + kWarpHeader;
+	float size[2] = { static_cast<float>(cur->params.w), static_cast<float>(cur->params.h) };
+	float scale[2] = { fx, fy };
+	float marker[3] = { 0.0f, 0.0f, 0.0f };
+	if (show_marker) {
+		const float box = std::max(8.0f, layout.h[layout.luma_plane] / 24.0f);
+		marker[0] = box * cur->params.w / layout.w[layout.luma_plane];
+		marker[1] = box * cur->params.h / layout.h[layout.luma_plane];
+		marker[2] = bicubic ? 0.92f : 0.5f;
+	}
+	return runPass(dispatch, "framegen blend", header, kBlendBody,
+	               { { "fg_prev", prev, true }, { "fg_cur", cur, true }, { "fg_mv", mv, false } },
+	               { { pl_var_vec2("fg_size"), size }, { pl_var_vec2("fg_mv_scale"), scale },
+	                 { pl_var_float("fg_t"), &t }, { pl_var_vec3("fg_marker"), marker } },
+	               dst, timers[kTimerBlend + plane]);
 }
 
 bool FrameGenerator::projectPass(pl_tex mv, pl_tex dst, float factor)
@@ -884,6 +1120,89 @@ bool FrameGenerator::estimateMotion()
 	return ok;
 }
 
+bool FrameGenerator::estimateBackward()
+{
+	const Slot &c = history[cur_slot];
+	const Slot &p = history[prev_slot];
+	// Previous -> current at full detail, checked against current -> previous.
+	return searchPass(p.pyramid[0], c.pyramid[0], mvb_level[1], mvb_level[0], 0, 1, 1, true)
+	    && checkPass(mvb_level[0], mv_level[1], mv_proj, kTimerCheckBack)
+	    && fillPass(mv_proj, mvb_level[0], kTimerFillBack)
+	    && smoothPass(mvb_level[0], mvb_final, kTimerSmoothBack);
+}
+
+void FrameGenerator::finishOutput(const struct pl_frame *src, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out) const
+{
+	*out = *src;
+	for (int i = 0; i < layout.num_planes; i++)
+		out->planes[i].texture = out_tex[i];
+	out->acquire = nullptr;
+	out->release = nullptr;
+	out->user_data = nullptr;
+	out->prev = nullptr;
+	out->next = nullptr;
+	out->icc = nullptr;
+	std::memset(&out->profile, 0, sizeof(out->profile));
+	out->lut = nullptr;
+	out->overlays = nullptr;
+	out->num_overlays = 0;
+	std::memset(&out->film_grain, 0, sizeof(out->film_grain));
+	out->repr.dovi = nullptr;
+}
+
+bool FrameGenerator::interpolate(const struct pl_frame *meta, float t, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out)
+{
+	if (!meta || !out_tex || !out || !canPredict())
+		return false;
+	if (meta->num_planes != layout.num_planes)
+		return false;
+	if (motion_pending) {
+		motion_valid = estimateMotion();
+		motion_pending = false;
+		if (!motion_valid) {
+			recordFailure();
+			return false;
+		}
+	}
+	if (!motion_valid)
+		return false;
+	if (!backward_valid) {
+		backward_valid = estimateBackward();
+		if (!backward_valid) {
+			recordFailure();
+			return false;
+		}
+	}
+	t = std::min(1.0f, std::max(0.0f, t));
+	if (!interpPass(t, mv_proj)) {
+		recordFailure();
+		return false;
+	}
+	const Slot &c = history[cur_slot];
+	const Slot &p = history[prev_slot];
+	const float lw = static_cast<float>(layout.w[layout.luma_plane]);
+	const float lh = static_cast<float>(layout.h[layout.luma_plane]);
+	for (int i = 0; i < layout.num_planes; i++) {
+		struct pl_tex_params params;
+		std::memset(&params, 0, sizeof(params));
+		params.w = layout.w[i];
+		params.h = layout.h[i];
+		params.format = c.planes[i]->params.format;
+		params.sampleable = true;
+		params.renderable = true;
+		const float fx = 2.0f * (layout.w[i] / lw);
+		const float fy = 2.0f * (layout.h[i] / lh);
+		if (!pl_tex_recreate(gpu, &out_tex[i], &params)
+		    || !blendPass(p.planes[i], c.planes[i], mv_proj, out_tex[i], fx, fy, t, i == layout.luma_plane, i)) {
+			recordFailure();
+			return false;
+		}
+	}
+	finishOutput(meta, out_tex, out);
+	stat_generated.fetch_add(1);
+	return true;
+}
+
 bool FrameGenerator::generate(const struct pl_frame *src, float factor, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out)
 {
 	const Slot &c = history[cur_slot];
@@ -908,21 +1227,7 @@ bool FrameGenerator::generate(const struct pl_frame *src, float factor, pl_tex o
 			return false;
 	}
 
-	*out = *src;
-	for (int i = 0; i < layout.num_planes; i++)
-		out->planes[i].texture = out_tex[i];
-	out->acquire = nullptr;
-	out->release = nullptr;
-	out->user_data = nullptr;
-	out->prev = nullptr;
-	out->next = nullptr;
-	out->icc = nullptr;
-	std::memset(&out->profile, 0, sizeof(out->profile));
-	out->lut = nullptr;
-	out->overlays = nullptr;
-	out->num_overlays = 0;
-	std::memset(&out->film_grain, 0, sizeof(out->film_grain));
-	out->repr.dovi = nullptr;
+	finishOutput(src, out_tex, out);
 	return true;
 }
 
@@ -1003,8 +1308,23 @@ bool FrameGenerator::analyze(const struct pl_frame *src, double pts, bool *is_ne
 				const int interval = dups_since_unique + 1;
 				cadence = std::min(8.0, std::max(1.0, cadence * 0.85 + interval * 0.15));
 				const double dt = pts - history[cur_slot].pts;
-				if (dt > 0.0 && dt < kMaxMotionAge)
-					frame_interval = frame_interval > 0.0 ? frame_interval * 0.8 + dt * 0.2 : dt;
+				if (dt > 0.0 && dt < kMaxMotionAge) {
+					// A game frame that looked exactly like the one before (e.g. the
+					// camera at the turning point of a swing) is taken for a repeat,
+					// so the gap spans two game frames. Count it as such unless gaps
+					// that long keep coming, which means the game got slower.
+					double sample = dt;
+					if (frame_interval > 0.0) {
+						const double n = std::round(dt / frame_interval);
+						if (n >= 2.0 && std::fabs(dt / n - frame_interval) < 0.2 * frame_interval && long_gaps < 3) {
+							sample = dt / n;
+							long_gaps++;
+						} else {
+							long_gaps = 0;
+						}
+					}
+					frame_interval = frame_interval > 0.0 ? frame_interval * 0.8 + sample * 0.2 : dt;
+				}
 			}
 			const int old_prev = prev_slot;
 			prev_slot = have_cur ? cur_slot : -1;
@@ -1023,6 +1343,7 @@ bool FrameGenerator::analyze(const struct pl_frame *src, double pts, bool *is_ne
 			dups_since_unique = 0;
 			motion_pending = prev_slot >= 0 && pts - history[prev_slot].pts < kMaxMotionAge;
 			motion_valid = false;
+			backward_valid = false;
 			stat_unique.fetch_add(1);
 		}
 	} else if (ok) {

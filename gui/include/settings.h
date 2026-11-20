@@ -533,6 +533,10 @@ class Settings : public QObject
 		// How much of the change in speed predictions take into account, in percent (0..100)
 		int GetFrameGenerationDamping() const { return qBound(0, settings.value("settings/frame_generation_acceleration", 100).toInt(), 100); }
 		void SetFrameGenerationDamping(int percent) { settings.setValue("settings/frame_generation_acceleration", qBound(0, percent, 100)); }
+		// Share of the possible delay used for interpolation: 0 = predict only (no
+		// delay), 100 = in-between frames only (cleanest, most delay).
+		int GetFrameGenerationDelay() const { return qBound(0, settings.value("settings/frame_generation_delay", 100).toInt(), 100); }
+		void SetFrameGenerationDelay(int percent) { settings.setValue("settings/frame_generation_delay", qBound(0, percent, 100)); }
 		bool GetFrameGenerationMarker() const { return settings.value("settings/frame_generation_marker", false).toBool(); }
 		void SetFrameGenerationMarker(bool enabled) { settings.setValue("settings/frame_generation_marker", enabled); }
 		bool GetFrameGenerationControlWindow() const { return settings.value("settings/frame_generation_control_window", true).toBool(); }

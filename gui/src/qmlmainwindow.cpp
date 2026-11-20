@@ -4984,6 +4984,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
     fg_max_prediction.store(settings->GetFrameGenerationMaxPrediction() / 100.0f);
     fg_threshold.store(settings->GetFrameGenerationThreshold() / 10.0f);
     fg_damping.store(settings->GetFrameGenerationDamping() / 100.0f);
+    fg_delay.store(settings->GetFrameGenerationDelay() / 100.0f);
     fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     render_backend = settings->GetRenderBackend();
     setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
@@ -6036,6 +6037,7 @@ void QmlMainWindow::loadFrameGenerationSettings()
     fg_max_prediction.store(settings->GetFrameGenerationMaxPrediction() / 100.0f);
     fg_threshold.store(settings->GetFrameGenerationThreshold() / 10.0f);
     fg_damping.store(settings->GetFrameGenerationDamping() / 100.0f);
+    fg_delay.store(settings->GetFrameGenerationDelay() / 100.0f);
     fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     updateFrameGenerationDisplayRate();
 }
@@ -6126,9 +6128,12 @@ bool QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
         return false;
     }
 
-    // Display-rate mode: a real frame is shown the moment it arrives, the
-    // pacer ticks in between show predictions. Direct mapping never
-    // re-submits a frame, so the arrival time serves as pts.
+    // Display-rate mode. The picture shown at time `now` belongs to the game
+    // time `now - delay`: with no delay every picture after a real frame is a
+    // prediction; with a delay the generator interpolates between the two
+    // newest real frames, which needs no guessing. Ticks are counted from the
+    // arrival of the newest real frame. Direct mapping never re-submits a
+    // frame, so the arrival time serves as pts.
     FrameGenerator *fg = ensureFrameGenerator(gpu);
     if (!fg) {
         fg_direct_frame_valid = false;
@@ -6136,11 +6141,14 @@ bool QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
     }
     if (new_mapping) {
         bool is_new = true;
-        if (!fg->analyze(&direct_frame, static_cast<double>(now_us) / 1e6, &is_new) || is_new) {
+        const bool analysed = fg->analyze(&direct_frame, static_cast<double>(now_us) / 1e6, &is_new);
+        if (!analysed || is_new) {
             fg_unique_shown_us = now_us;
-            fg_direct_frame_valid = false;
-            fg_last_factor = 0.0f;
             fg_pace_fired_us.store(0);
+            fg_last_factor = -1.0f;
+            fg_direct_frame_valid = false;
+            if (analysed)
+                showFrameGenerationTick(fg, 0.0, target_hz);
             armFrameGenPacer(now_us);
             return false;
         }
@@ -6151,8 +6159,7 @@ bool QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
         fg_pace_renders.fetchAndAddRelaxed(1);
         fg_pace_dispatch_us.fetchAndAddRelaxed(static_cast<quint64>(now_us - fired_us));
     }
-    const double interval = fg->gameFrameInterval();
-    if (fg_unique_shown_us <= 0 || interval <= 0.0 || !fg->canPredict() || !fg_pace_thread)
+    if (fg_unique_shown_us <= 0 || fg->gameFrameInterval() <= 0.0 || !fg->canPredict() || !fg_pace_thread)
         return false;
     // Only pacer ticks change the picture. A repeated stream frame or a render
     // for another reason shows nothing new; presenting it anyway would put an
@@ -6160,26 +6167,60 @@ bool QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
     // next tick back by one refresh. render() still presents if the UI changed.
     if (!pacer_tick)
         return true;
-    // Predict for the tick this render belongs to, so the steps between the
-    // pictures stay equal even if the render runs a little late.
+    // The tick this render belongs to, so the steps between the pictures stay
+    // equal even if the render runs a little late.
     const double tick_us = 1e6 / target_hz;
     const double tick = std::floor(static_cast<double>(now_us - fg_unique_shown_us) / tick_us + 0.5);
     if (tick < 1.0)
         return true; // stale tick from before the newest real frame
-    const double factor = tick * tick_us / 1e6 / interval;
-    const float max_factor = fg_max_prediction.load();
-    if (factor < 2.0) {
-        const float target = static_cast<float>(qMin<double>(factor, max_factor));
-        // Once the cap is reached the picture holds until the next real frame.
-        if (fg_direct_frame_valid && qAbs(target - fg_last_factor) <= 1e-4f) {
-            armFrameGenPacer(now_us, tick + 1.0);
-            return true;
-        }
-        fg_direct_frame_valid = fg->predict(&direct_frame, target, fg_direct_tex.data(), &fg_direct_frame);
-        fg_last_factor = fg_direct_frame_valid ? target : 0.0f;
-    }
+    const bool changed = showFrameGenerationTick(fg, tick, target_hz);
     armFrameGenPacer(now_us, tick + 1.0);
-    return false;
+    return !changed;
+}
+
+double QmlMainWindow::frameGenerationDelaySeconds(double interval, double target_hz) const
+{
+    if (interval <= 0.0 || target_hz <= 0.0)
+        return 0.0;
+    // At most one game frame minus one output frame: then the newest real
+    // frame is reached exactly when the next one is due.
+    return fg_delay.load() * qMax(0.0, interval - 1.0 / target_hz);
+}
+
+bool QmlMainWindow::showFrameGenerationTick(FrameGenerator *fg, double tick, double target_hz)
+{
+    const double interval = fg->gameFrameInterval();
+    if (interval <= 0.0 || !fg->canPredict()) {
+        const bool changed = fg_direct_frame_valid;
+        fg_direct_frame_valid = false;
+        return changed;
+    }
+    const double delay = frameGenerationDelaySeconds(interval, target_hz);
+    // Position between the previous (0) and the newest (1) real frame; above 1
+    // it is a prediction beyond the newest frame.
+    const double t = 1.0 + (tick / target_hz - delay) / interval;
+    float position;
+    bool predicted;
+    if (t < 0.98) {
+        position = static_cast<float>(qMax(0.0, t));
+        predicted = true;
+    } else {
+        const double ahead = qMin<double>(t - 1.0, fg_max_prediction.load());
+        predicted = ahead >= 0.04;
+        position = predicted ? static_cast<float>(1.0 + ahead) : 1.0f;
+    }
+    if (qAbs(position - fg_last_factor) <= 1e-4f && fg_direct_frame_valid == predicted)
+        return false; // the same picture as now
+    fg_last_factor = position;
+    if (!predicted) {
+        fg_direct_frame_valid = false;
+        return true;
+    }
+    if (position < 1.0f)
+        fg_direct_frame_valid = fg->interpolate(&direct_frame, position, fg_direct_tex.data(), &fg_direct_frame);
+    else
+        fg_direct_frame_valid = fg->predict(&direct_frame, position - 1.0f, fg_direct_tex.data(), &fg_direct_frame);
+    return true;
 }
 
 void QmlMainWindow::armFrameGenPacer(qint64 now_us, double min_next_tick)
@@ -6191,15 +6232,20 @@ void QmlMainWindow::armFrameGenPacer(qint64 now_us, double min_next_tick)
     const double interval = fg->gameFrameInterval();
     if (interval <= 0.0)
         return;
-    // Refresh ticks are aligned to the moment the newest real frame was shown.
+    // Ticks are aligned to the arrival of the newest real frame.
     const double tick_us = 1e6 / target_hz;
     const double elapsed_us = static_cast<double>(now_us - fg_unique_shown_us);
     // Never the tick that was just shown, even if its render ran late.
     const double next_tick = qMax(std::floor(elapsed_us / tick_us) + 1.0, min_next_tick);
-    const double next_rel_us = next_tick * tick_us;
-    if (next_rel_us / 1e6 / interval > fg_max_prediction.load() + 1e-3)
+    const double next_rel_s = next_tick * tick_us / 1e6;
+    // The next real frame is due one interval after the newest and renders by
+    // itself; if it is late, the picture holds instead of guessing further.
+    if (next_rel_s > interval - 0.5 / target_hz)
+        return;
+    const double ahead = (next_rel_s - frameGenerationDelaySeconds(interval, target_hz)) / interval;
+    if (ahead > fg_max_prediction.load() + 1e-3)
         return; // nothing new to show before the next real frame
-    fg_pace_thread->arm(fg_unique_shown_us + static_cast<qint64>(next_rel_us));
+    fg_pace_thread->arm(fg_unique_shown_us + static_cast<qint64>(next_tick * tick_us));
 }
 
 void QmlMainWindow::requestFrameGenerationRender(qint64 fired_us)
@@ -6230,6 +6276,8 @@ FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
     info.supported = !fg || fg->valid();
     if (fg)
         info.stats = fg->stats();
+    if (info.paced && fg)
+        info.delay_ms = frameGenerationDelaySeconds(info.stats.frame_interval, info.target_hz) * 1000.0;
     return info;
 }
 

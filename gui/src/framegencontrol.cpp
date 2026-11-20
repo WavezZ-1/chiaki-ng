@@ -59,10 +59,20 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	mode_box->addItem(tr("60 fps (doppelte Bilder ersetzen)"));
 	mode_box->addItem(tr("Bis 120 fps"));
 	mode_box->addItem(tr("Bildschirmrate"));
-	mode_box->setToolTip(tr("Bei 120 fps und Bildschirmrate entstehen zwischen zwei echten Bildern "
-	                        "mehrere vorhergesagte. Das Bild wird flüssiger, die Steuerung reagiert "
+	mode_box->setToolTip(tr("Bei „Bis 120 fps“ und „Bildschirmrate“ entstehen zwischen zwei echten Bildern "
+	                        "mehrere berechnete. Das Bild wird flüssiger, die Steuerung reagiert "
 	                        "aber weiter im Takt des Spiels."));
 	mode_layout->addWidget(mode_box);
+	method_box = new QComboBox;
+	method_box->addItem(tr("Zwischenbilder – sauberstes Bild"));
+	method_box->addItem(tr("Gemischt"));
+	method_box->addItem(tr("Vorhersage – keine Verzögerung"));
+	method_box->setToolTip(tr("Zwischenbilder werden zwischen zwei echten Bildern berechnet: auch bei "
+	                          "schnellen Drehungen und ruckartigen Animationen sauber, dafür erscheint das "
+	                          "Bild knapp ein Spielbild später. Die Vorhersage rät das nächste Bild ohne "
+	                          "Verzögerung, verzerrt aber bei schnellen oder plötzlichen Bewegungen. "
+	                          "Gemischt liegt dazwischen."));
+	mode_layout->addWidget(method_box);
 	root->addWidget(mode_group);
 
 	// Tuning
@@ -79,9 +89,9 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	prediction_row->addWidget(prediction_slider);
 	prediction_row->addWidget(prediction_value);
 	auto *prediction_label = new QLabel(tr("Max. Vorhersage:"));
-	prediction_label->setToolTip(tr("Wie weit ein Zwischenbild höchstens in die Zukunft rät (in % eines "
-	                                "Spielbilds). Weniger = weniger Fehler bei plötzlichen Richtungswechseln, "
-	                                "dafür steht das Bild kurz vor dem nächsten echten Bild still."));
+	prediction_label->setToolTip(tr("Nur für „Vorhersage“ und „Gemischt“: wie weit ein Bild höchstens in die "
+	                                "Zukunft rät (in % eines Spielbilds). Weniger = weniger Fehler bei plötzlichen "
+	                                "Richtungswechseln, dafür steht das Bild kurz vor dem nächsten echten Bild still."));
 	prediction_slider->setToolTip(prediction_label->toolTip());
 	tune_layout->addRow(prediction_label, prediction_row);
 
@@ -117,7 +127,7 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	threshold_slider->setToolTip(threshold_label->toolTip());
 	tune_layout->addRow(threshold_label, threshold_row);
 
-	marker_box = new QCheckBox(tr("Vorhergesagte Bilder markieren (Quadrat oben links)"));
+	marker_box = new QCheckBox(tr("Berechnete Bilder markieren (Quadrat oben links)"));
 	tune_layout->addRow(marker_box);
 	on_top_box = new QCheckBox(tr("Fenster immer im Vordergrund"));
 	tune_layout->addRow(on_top_box);
@@ -142,7 +152,7 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	live_layout->addRow(tr("Spiel-fps:"), game_fps_label);
 	live_layout->addRow(tr("Stream-fps:"), stream_fps_label);
 	live_layout->addRow(tr("Ausgabe-fps:"), output_fps_label);
-	live_layout->addRow(tr("Davon vorhergesagt:"), generated_label);
+	live_layout->addRow(tr("Davon berechnet:"), generated_label);
 	live_layout->addRow(tr("GPU-Zeit:"), gpu_label);
 	live_layout->addRow(tr("Bildunterschied:"), metric_label);
 	live_layout->addRow(tr("Taktgeber:"), pacer_label);
@@ -158,6 +168,11 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	connect(mode_box, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
 		if (!syncing)
 			this->settings->setFrameGenerationMode(index);
+	});
+	connect(method_box, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+		static const int delays[] = { 100, 50, 0 };
+		if (!syncing && index >= 0 && index < 3)
+			this->settings->setFrameGenerationDelay(delays[index]);
 	});
 	connect(prediction_slider, &QSlider::valueChanged, this, [this](int value) {
 		prediction_value->setText(tr("%1 %").arg(value));
@@ -207,6 +222,8 @@ void FrameGenControlWindow::syncFromSettings()
 {
 	syncing = true;
 	mode_box->setCurrentIndex(settings->frameGenerationMode());
+	const int delay = settings->frameGenerationDelay();
+	method_box->setCurrentIndex(delay >= 75 ? 0 : (delay >= 25 ? 1 : 2));
 	prediction_slider->setValue(settings->frameGenerationMaxPrediction());
 	prediction_value->setText(tr("%1 %").arg(prediction_slider->value()));
 	damping_slider->setValue(settings->frameGenerationDamping());
@@ -278,9 +295,13 @@ void FrameGenControlWindow::refreshStats()
 	if (!info.mode || !st.gpu_timers || !sampled)
 		gpu_label->setText(QStringLiteral("–"));
 	else
-		gpu_label->setText(tr("%1 ms je Vorhersage, %2 ms Analyse je Bild")
+		gpu_label->setText(tr("%1 ms je berechnetem Bild, %2 ms Analyse je Bild")
 		                   .arg(predict_ms, 0, 'f', 2).arg(analyse_ms, 0, 'f', 2));
-	if (info.paced)
+	method_box->setEnabled(info.mode >= 2);
+	if (info.paced && info.delay_ms >= 0.5)
+		display_label->setText(tr("%1 Hz, Ziel %2 fps, Bild %3 ms später")
+		                       .arg(qRound(info.display_hz)).arg(qRound(info.target_hz)).arg(qRound(info.delay_ms)));
+	else if (info.paced)
 		display_label->setText(tr("%1 Hz, Ziel %2 fps").arg(qRound(info.display_hz)).arg(qRound(info.target_hz)));
 	else
 		display_label->setText(tr("%1 Hz").arg(qRound(info.display_hz)));

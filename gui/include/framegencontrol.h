@@ -36,6 +36,7 @@ private:
 	QmlMainWindow *window;
 
 	QComboBox *mode_box;
+	QComboBox *method_box;
 	QSlider *prediction_slider;
 	QLabel *prediction_value;
 	QSlider *damping_slider;

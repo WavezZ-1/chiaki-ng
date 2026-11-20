@@ -1045,6 +1045,20 @@ void QmlSettings::setFrameGenerationDamping(int percent)
     emit placeboChanged();
 }
 
+int QmlSettings::frameGenerationDelay() const
+{
+    return settings->GetFrameGenerationDelay();
+}
+
+void QmlSettings::setFrameGenerationDelay(int percent)
+{
+    if (percent == settings->GetFrameGenerationDelay())
+        return;
+    settings->SetFrameGenerationDelay(percent);
+    emit frameGenerationChanged();
+    emit placeboChanged();
+}
+
 bool QmlSettings::frameGenerationMarker() const
 {
     return settings->GetFrameGenerationMarker();
