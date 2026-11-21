@@ -401,10 +401,10 @@ void FrameGenControlWindow::applyPictureStyle(int style)
 	// temperature, deband, sharpening
 	static const int presets[][10] = {
 		{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },          // 1 off
-		{ 20, 15, 15, 0, 0, 0, 0, 0, 1, 30 },      // 2 natural
-		{ 25, 35, 40, 5, 15, 0, 0, 0, 1, 45 },     // 3 vivid
-		{ 25, 20, 10, -5, 20, -5, 0, 15, 1, 25 },  // 4 cinema
-		{ 35, 25, 15, 0, 0, 5, 55, 0, 1, 30 },     // 5 dark scenes
+		{ 20, 35, 30, 0, 10, 0, 0, 0, 1, 40 },     // 2 natural
+		{ 25, 70, 70, 10, 25, 0, 0, 0, 1, 65 },    // 3 vivid
+		{ 25, 45, 20, -5, 35, -5, 0, 20, 1, 40 },  // 4 cinema
+		{ 35, 45, 25, 0, 10, 5, 65, 0, 1, 45 },    // 5 dark scenes
 	};
 	if (style < 1 || style > 5) {
 		settings->setPictureSetting(static_cast<int>(PictureSetting::Style), 0);

@@ -553,7 +553,7 @@ class Settings : public QObject
 		// Share of the possible delay used for interpolation: 0 = predict only (no
 		// delay), 100 = in-between frames only (cleanest, most delay).
 		// Contrast adaptive sharpening after scaling, 0 = off, 1..100 = light..strong.
-		int GetSharpening() const { return qBound(0, settings.value("settings/sharpening", 30).toInt(), 100); }
+		int GetSharpening() const { return qBound(0, settings.value("settings/sharpening", 40).toInt(), 100); }
 		static int PictureSettingMin(PictureSetting s)
 		{
 			switch (s) {
@@ -580,8 +580,9 @@ class Settings : public QObject
 			switch (s) {
 			case PictureSetting::Style: return 2;
 			case PictureSetting::Cleanup: return 20;
-			case PictureSetting::Clarity: return 15;
-			case PictureSetting::Vibrance: return 15;
+			case PictureSetting::Clarity: return 35;
+			case PictureSetting::Vibrance: return 30;
+			case PictureSetting::Contrast: return 10;
 			case PictureSetting::Deband: return 1;
 			default: return 0;
 			}
