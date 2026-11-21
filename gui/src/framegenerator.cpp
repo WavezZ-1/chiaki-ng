@@ -41,6 +41,12 @@ constexpr float kConfAbsHigh = 0.08f;
 constexpr float kConfRelLow = 0.45f;
 constexpr float kConfRelHigh = 0.85f;
 
+// Interpolation: ratio of the frame difference along the motion paths to the
+// difference without motion, per region, from which on the region is
+// cross-faded instead (fully at the upper value).
+constexpr float kConfRatioLow = 0.6f;
+constexpr float kConfRatioHigh = 0.9f;
+
 // Motion search: cost per level-0 pixel of deviating from the reference vector.
 constexpr float kSmoothLambda = 0.0001f;
 
@@ -671,6 +677,42 @@ const char *kAccelBody = R"(
     color = vec4(s, 0.0, 0.0);
 )";
 
+// How much a region gains from motion: per tile (32x18), the mean luma
+// difference between the two frames along the chosen paths (e_m) against the
+// difference at the same spot without motion (e_0), over pixels that are
+// visible in both frames. Where motion explains the change (camera turns,
+// driving) e_m is far below e_0. Where it does not (light flashes, reflections
+// wandering over a still object, dark noisy areas), the vectors are guesses
+// and a soft cross-fade looks better than shifting things around.
+// Output: (cross-fade weight, e_m, e_0, samples).
+const char *kConfBody = R"(
+    ivec2 tile = ivec2(gl_FragCoord.xy);
+    vec2 size = vec2(textureSize(fg_mv, 0));
+    vec2 tsize = size / vec2(32.0, 18.0);
+    vec2 origin = vec2(tile) * tsize;
+    vec2 stp = tsize / 12.0;
+    float em = 0.0, e0 = 0.0, n = 0.0;
+    for (int j = 0; j < 12; j++) {
+        for (int i = 0; i < 12; i++) {
+            vec2 y = origin + (vec2(float(i), float(j)) + 0.5) * stp;
+            vec4 f = texelFetch(fg_mv, ivec2(y), 0);
+            if (f.z <= 0.02 || f.z >= 0.98)
+                continue; // seen in one frame only
+            vec2 sp = texelFetch(fg_s, ivec2(y), 0).xy;
+            em += abs(texture(fg_prevl, (y - sp) / size).r - texture(fg_curl, (y - sp + f.xy) / size).r);
+            e0 += abs(texture(fg_prevl, y / size).r - texture(fg_curl, y / size).r);
+            n += 1.0;
+        }
+    }
+    float w = 0.0;
+    if (n >= 12.0) {
+        em /= n;
+        e0 /= n;
+        w = smoothstep(fg_conf_lim.x, fg_conf_lim.y, em / (e0 + 0.002));
+    }
+    color = vec4(w, em, e0, n);
+)";
+
 const char *kBlendBody = R"(
     vec2 pc = gl_FragCoord.xy;
     vec4 mv = texture(fg_mv, pc / fg_size);
@@ -695,7 +737,14 @@ const char *kBlendBody = R"(
         w = 1.0;
     else if (bout && !aout)
         w = 0.0;
-    color = clamp(mix(a, b, w), 0.0, 1.0);
+    color = mix(a, b, w);
+#if FG_CONF
+    // Regions where motion does not explain the change: soft cross-fade.
+    float cf = texture(fg_conf, pc / fg_size).x;
+    if (cf > 0.001)
+        color = mix(color, mix(texture(fg_prev, pc / fg_size), texture(fg_cur, pc / fg_size), fg_t), cf);
+#endif
+    color = clamp(color, 0.0, 1.0);
     if (pc.x < fg_marker.x && pc.y < fg_marker.y)
         color = vec4(fg_marker.z);
 )";
@@ -790,6 +839,7 @@ void FrameGenerator::releaseResources()
 	pl_tex_destroy(gpu, &mvb_final);
 	pl_tex_destroy(gpu, &tile_tex);
 	pl_tex_destroy(gpu, &path_tex);
+	pl_tex_destroy(gpu, &conf_tex);
 	pl_tex_destroy(gpu, &global_tex);
 	pl_tex_destroy(gpu, &global_back_tex);
 	pl_tex_destroy(gpu, &mv_prev_final);
@@ -924,6 +974,7 @@ bool FrameGenerator::ensureResources(const struct pl_frame *src)
 	ok = ok && (mvb_final = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (tile_tex = make(16, 9, fmt_mv, false));
 	ok = ok && (path_tex = make(lw[0], lh[0], fmt_mv, false));
+	ok = ok && (conf_tex = make(32, 18, fmt_mv, false));
 	ok = ok && (global_tex = make(1, 1, fmt_mv, false));
 	ok = ok && (global_back_tex = make(1, 1, fmt_mv, false));
 	ok = ok && (mv_final = make(lw[0], lh[0], fmt_mv, false));
@@ -1126,7 +1177,8 @@ bool FrameGenerator::accelPass(float t, pl_tex mv, pl_tex dst)
 
 bool FrameGenerator::blendPass(pl_tex prev, pl_tex cur, pl_tex mv, pl_tex dst, float fx, float fy, float t, bool bicubic, int plane)
 {
-	const std::string header = std::string(bicubic ? "#define FG_BICUBIC 1\n" : "#define FG_BICUBIC 0\n") + kWarpHeader;
+	const std::string header = std::string(bicubic ? "#define FG_BICUBIC 1\n" : "#define FG_BICUBIC 0\n")
+	                         + "#define FG_CONF 1\n" + kWarpHeader;
 	float size[2] = { static_cast<float>(cur->params.w), static_cast<float>(cur->params.h) };
 	float scale[2] = { fx, fy };
 	float marker[3] = { 0.0f, 0.0f, 0.0f };
@@ -1138,7 +1190,7 @@ bool FrameGenerator::blendPass(pl_tex prev, pl_tex cur, pl_tex mv, pl_tex dst, f
 	}
 	return runPass(dispatch, "framegen blend", header, kBlendBody,
 	               { { "fg_prev", prev, true }, { "fg_cur", cur, true }, { "fg_mv", mv, false },
-	                 { "fg_s", path_tex, false } },
+	                 { "fg_s", path_tex, false }, { "fg_conf", conf_tex, true } },
 	               { { pl_var_vec2("fg_size"), size }, { pl_var_vec2("fg_mv_scale"), scale },
 	                 { pl_var_float("fg_t"), &t }, { pl_var_vec3("fg_marker"), marker } },
 	               dst, timers[kTimerBlend + plane]);
@@ -1326,10 +1378,15 @@ bool FrameGenerator::interpolate(const struct pl_frame *meta, float t, pl_tex ou
 	t = std::min(1.0f, std::max(0.0f, t));
 	// mv_level[0] is free once the final fields exist, so it holds the
 	// smoothed interpolation field.
+	float conf_lim[2] = { kConfRatioLow, kConfRatioHigh };
 	if (!interpPass(t, mv_proj)
 	    || !runPass(dispatch, "framegen interpolate smooth", std::string(), kInterpSmoothBody,
 	                { { "fg_src", mv_proj, false } }, {}, mv_level[0], timers[kTimerInterpSmooth])
-	    || !accelPass(t, mv_level[0], path_tex)) {
+	    || !accelPass(t, mv_level[0], path_tex)
+	    || !runPass(dispatch, "framegen confidence", std::string(), kConfBody,
+	                { { "fg_mv", mv_level[0], false }, { "fg_s", path_tex, false },
+	                  { "fg_prevl", history[prev_slot].pyramid[0], true }, { "fg_curl", history[cur_slot].pyramid[0], true } },
+	                { { pl_var_vec2("fg_conf_lim"), conf_lim } }, conf_tex, timers[kTimerConf])) {
 		recordFailure();
 		return false;
 	}

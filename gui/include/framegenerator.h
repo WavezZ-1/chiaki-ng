@@ -154,6 +154,7 @@ private:
 		kTimerGlobalBack,
 		kTimerAccel,
 		kTimerInterpSmooth,
+		kTimerConf,
 		kTimerCount
 	};
 
@@ -224,6 +225,7 @@ private:
 	pl_tex global_tex = nullptr;    // dominant motion of the whole picture (1x1)
 	pl_tex global_back_tex = nullptr; // the same for the backward field
 	pl_tex path_tex = nullptr;      // interpolation: offset into the previous frame
+	pl_tex conf_tex = nullptr;      // interpolation: cross-fade weight per region (32x18)
 	pl_tex mv_proj = nullptr;
 	pl_tex mv_prev_final = nullptr; // motion of the previous pair of game frames
 	pl_tex diff_tex = nullptr;
