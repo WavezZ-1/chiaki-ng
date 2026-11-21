@@ -1059,6 +1059,25 @@ void QmlSettings::setSharpening(int percent)
     emit placeboChanged();
 }
 
+int QmlSettings::pictureSetting(int which) const
+{
+    if (which < 0 || which >= static_cast<int>(PictureSetting::Count))
+        return 0;
+    return settings->GetPictureSetting(static_cast<PictureSetting>(which));
+}
+
+void QmlSettings::setPictureSetting(int which, int value)
+{
+    if (which < 0 || which >= static_cast<int>(PictureSetting::Count))
+        return;
+    const PictureSetting s = static_cast<PictureSetting>(which);
+    if (value == settings->GetPictureSetting(s))
+        return;
+    settings->SetPictureSetting(s, value);
+    emit frameGenerationChanged();
+    emit placeboChanged();
+}
+
 int QmlSettings::frameGenerationDelay() const
 {
     return settings->GetFrameGenerationDelay();

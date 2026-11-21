@@ -2559,6 +2559,18 @@ static const char *render_params_path()
     return qPrintable(path);
 }
 
+// Sets a tunable //!PARAM of a user shader (float parameters only).
+static void set_hook_param(const struct pl_hook *hook, const char *name, float value)
+{
+    if (!hook)
+        return;
+    for (int i = 0; i < hook->num_parameters; i++) {
+        const struct pl_hook_par &par = hook->parameters[i];
+        if (par.data && par.type == PL_VAR_FLOAT && strcmp(par.name, name) == 0)
+            par.data->f = value;
+    }
+}
+
 static const struct pl_hook *load_mpv_hook(pl_gpu gpu, const QString &path)
 {
     QFile file(path);
@@ -2829,6 +2841,9 @@ QmlMainWindow::~QmlMainWindow()
     pl_mpv_user_shader_destroy(&fsrcnnx_hook_8);
     pl_mpv_user_shader_destroy(&fsrcnnx_hook_16);
     pl_mpv_user_shader_destroy(&sharpen_hook);
+    pl_mpv_user_shader_destroy(&cleanup_hook);
+    pl_mpv_user_shader_destroy(&clarity_hook);
+    pl_mpv_user_shader_destroy(&color_hook);
     if (render_backend == RenderBackend::Vulkan) {
         pl_vulkan_destroy(&placebo_vulkan);
         pl_vk_inst_destroy(&placebo_vk_inst);
@@ -4987,6 +5002,8 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
     fg_damping.store(settings->GetFrameGenerationDamping() / 100.0f);
     fg_delay.store(settings->GetFrameGenerationDelay() / 100.0f);
     sharpen_strength.store(settings->GetSharpening() / 100.0f);
+    for (size_t i = 0; i < picture_values.size(); i++)
+        picture_values[i].store(settings->GetPictureSetting(static_cast<PictureSetting>(i)));
     fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     render_backend = settings->GetRenderBackend();
     setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
@@ -5486,6 +5503,9 @@ renderer_backend_ready:
     this->fsrcnnx_hook_8 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_8-0-4-1.glsl"));
     this->fsrcnnx_hook_16 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_16-0-4-1.glsl"));
     this->sharpen_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/CAS.glsl"));
+    this->cleanup_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/Cleanup.glsl"));
+    this->clarity_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/Clarity.glsl"));
+    this->color_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/Color.glsl"));
 
 
     switch (settings->GetPlaceboPreset()) {
@@ -6042,6 +6062,8 @@ void QmlMainWindow::loadFrameGenerationSettings()
     fg_damping.store(settings->GetFrameGenerationDamping() / 100.0f);
     fg_delay.store(settings->GetFrameGenerationDelay() / 100.0f);
     sharpen_strength.store(settings->GetSharpening() / 100.0f);
+    for (size_t i = 0; i < picture_values.size(); i++)
+        picture_values[i].store(settings->GetPictureSetting(static_cast<PictureSetting>(i)));
     fg_marker.storeRelease(settings->GetFrameGenerationMarker() ? 1 : 0);
     updateFrameGenerationDisplayRate();
 }
@@ -6262,6 +6284,12 @@ void QmlMainWindow::requestFrameGenerationRender(qint64 fired_us)
     }, Qt::QueuedConnection);
 }
 
+void QmlMainWindow::setPictureCompare(bool on)
+{
+    if (picture_compare.exchange(on) != on)
+        scheduleUpdate(true, UpdateRequestReason::PendingFrame);
+}
+
 FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
 {
     FrameGenerationInfo info;
@@ -6288,6 +6316,9 @@ FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
     info.dst_h = scale_dst_h.load();
     info.upscaler = scale_kind.load();
     info.sharpening = qRound(sharpen_strength.load() * 100.0f);
+    info.picture_hdr = picture_hdr.load();
+    info.bitrate_mbps = session ? session->GetMeasuredBitrate() : 0.0;
+    info.picture_compare = picture_compare.load();
     return info;
 }
 
@@ -8039,17 +8070,52 @@ void QmlMainWindow::render()
         scale_dst_h.store(qRound(dst_height));
         scale_kind.store(!fsrcnnx_hook ? 0 : (fsrcnnx_hook == fsr_hook ? 1 : (fsrcnnx_hook == fsrcnnx_hook_8 ? 2 : 3)));
     }
-    // Sharpening runs after scaling, at the final size, also for generated frames.
+    // Picture enhancement, in processing order: compression cleanup on the
+    // decoded planes, clarity on the brightness, colour and tone on the RGB
+    // picture, then the scaler, then sharpening at the final size. Generated
+    // frames go through the same chain. Colour, tone and clarity assume an
+    // SDR picture and stay off for HDR streams.
     const float sharpen = stream_active ? sharpen_strength.load() : 0.0f;
-    const struct pl_hook *active_hooks[2] = {};
+    const bool hdr_source = hint_frame && pl_color_space_is_hdr(&hint_frame->color);
+    picture_hdr.store(hdr_source);
+    auto pic = [this](PictureSetting s) { return picture_values[static_cast<size_t>(s)].load() / 100.0f; };
+    const float compare = picture_compare.load() ? 1.0f : 0.0f;
+    const struct pl_hook *active_hooks[5] = {};
     int num_active_hooks = 0;
+    if (stream_active) {
+        if (cleanup_hook && pic(PictureSetting::Cleanup) > 0.001f) {
+            set_hook_param(cleanup_hook, "cleanup", pic(PictureSetting::Cleanup));
+            set_hook_param(cleanup_hook, "compare", compare);
+            active_hooks[num_active_hooks++] = cleanup_hook;
+        }
+        if (!hdr_source && clarity_hook && pic(PictureSetting::Clarity) > 0.001f) {
+            set_hook_param(clarity_hook, "clarity", pic(PictureSetting::Clarity));
+            set_hook_param(clarity_hook, "compare", compare);
+            active_hooks[num_active_hooks++] = clarity_hook;
+        }
+        const bool color_on = std::fabs(pic(PictureSetting::Vibrance)) + std::fabs(pic(PictureSetting::Saturation))
+                            + std::fabs(pic(PictureSetting::Contrast)) + std::fabs(pic(PictureSetting::Brightness))
+                            + std::fabs(pic(PictureSetting::Shadows)) + std::fabs(pic(PictureSetting::Temperature)) > 0.001f;
+        if (!hdr_source && color_hook && color_on) {
+            set_hook_param(color_hook, "vibrance", pic(PictureSetting::Vibrance));
+            set_hook_param(color_hook, "saturation", pic(PictureSetting::Saturation));
+            set_hook_param(color_hook, "contrast", pic(PictureSetting::Contrast));
+            set_hook_param(color_hook, "brightness", pic(PictureSetting::Brightness));
+            set_hook_param(color_hook, "shadows", pic(PictureSetting::Shadows));
+            set_hook_param(color_hook, "temperature", pic(PictureSetting::Temperature));
+            set_hook_param(color_hook, "compare", compare);
+            active_hooks[num_active_hooks++] = color_hook;
+        }
+        // Debanding (smooth gradients in sky and dark areas) unless the preset
+        // already does it.
+        if (picture_values[static_cast<size_t>(PictureSetting::Deband)].load() && !params.deband_params)
+            params.deband_params = &pl_deband_default_params;
+    }
     if (fsrcnnx_hook)
         active_hooks[num_active_hooks++] = fsrcnnx_hook;
     if (sharpen_hook && sharpen > 0.001f) {
-        for (int i = 0; i < sharpen_hook->num_parameters; i++) {
-            if (sharpen_hook->parameters[i].data && strcmp(sharpen_hook->parameters[i].name, "sharpness") == 0)
-                sharpen_hook->parameters[i].data->f = qBound(0.0f, sharpen, 1.0f);
-        }
+        set_hook_param(sharpen_hook, "sharpness", qBound(0.0f, sharpen, 1.0f));
+        set_hook_param(sharpen_hook, "compare", compare);
         active_hooks[num_active_hooks++] = sharpen_hook;
     }
     if (num_active_hooks > 0) {

@@ -2,6 +2,7 @@
 
 #include "streamsession.h"
 #include "settings.h"
+#include <array>
 
 #include <QMutex>
 #include <QAtomicInteger>
@@ -68,6 +69,9 @@ struct FrameGenerationInfo
     int dst_w = 0, dst_h = 0;    // size it is shown at
     int upscaler = 0;            // 0 standard scaler, 1 FSR, 2 FSRCNNX 8, 3 FSRCNNX 16
     int sharpening = 0;          // percent, 0 = off
+    bool picture_hdr = false;    // HDR stream: colour, clarity off
+    double bitrate_mbps = 0.0;   // measured stream bitrate
+    bool picture_compare = false;
     bool created = false;
     bool supported = true;
     quint64 video_presents = 0;  // video frames rendered so far
@@ -162,6 +166,8 @@ public:
     bool applyFrameGeneration(pl_gpu gpu, const struct pl_frame *src, double pts,
                               pl_tex *out_tex, struct pl_frame *out);
     FrameGenerationInfo frameGenerationInfo() const;
+    // Before/after view for the picture enhancement: left half untouched.
+    void setPictureCompare(bool on);
     void requestFrameGenerationRender(qint64 fired_us);
     QString describePlaceboDiscardReason(qint64 now_us) const;
 
@@ -542,6 +548,12 @@ private:
     const struct pl_hook *fsrcnnx_hook_16 = nullptr;
     const struct pl_hook *sharpen_hook = nullptr;
     std::atomic<float> sharpen_strength{0.3f};
+    const struct pl_hook *cleanup_hook = nullptr;
+    const struct pl_hook *clarity_hook = nullptr;
+    const struct pl_hook *color_hook = nullptr;
+    std::array<std::atomic<int>, static_cast<size_t>(PictureSetting::Count)> picture_values{};
+    std::atomic<bool> picture_compare{false};
+    std::atomic<bool> picture_hdr{false};
     // What the renderer last did with the picture (for the control window).
     std::atomic<int> scale_src_w{0};
     std::atomic<int> scale_src_h{0};

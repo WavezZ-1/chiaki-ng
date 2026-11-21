@@ -12,6 +12,23 @@
 #include <QMap>
 #include <QRect>
 
+// Picture enhancement (control window "Bild" tab). Values are percent; the
+// signed ones run from -100 to 100. Style picks a preset of all of them.
+enum class PictureSetting
+{
+	Style,          // 0 own, 1 off, 2 natural, 3 vivid, 4 cinema, 5 dark scenes
+	Cleanup,        // compression cleanup 0..100
+	Clarity,        // local contrast 0..100
+	Vibrance,       // 0..100
+	Saturation,     // -100..100
+	Contrast,       // -100..100
+	Brightness,     // -100..100
+	Shadows,        // 0..100
+	Temperature,    // -100..100 (warm > 0)
+	Deband,         // 0/1
+	Count
+};
+
 enum class ControllerButtonExt
 {
 	// must not overlap with ChiakiControllerButton and ChiakiControllerAnalogButton
@@ -537,6 +554,53 @@ class Settings : public QObject
 		// delay), 100 = in-between frames only (cleanest, most delay).
 		// Contrast adaptive sharpening after scaling, 0 = off, 1..100 = light..strong.
 		int GetSharpening() const { return qBound(0, settings.value("settings/sharpening", 30).toInt(), 100); }
+		static int PictureSettingMin(PictureSetting s)
+		{
+			switch (s) {
+			case PictureSetting::Saturation:
+			case PictureSetting::Contrast:
+			case PictureSetting::Brightness:
+			case PictureSetting::Temperature:
+				return -100;
+			default:
+				return 0;
+			}
+		}
+		static int PictureSettingMax(PictureSetting s)
+		{
+			switch (s) {
+			case PictureSetting::Style: return 5;
+			case PictureSetting::Deband: return 1;
+			default: return 100;
+			}
+		}
+		static int PictureSettingDefault(PictureSetting s)
+		{
+			// The "natural" style.
+			switch (s) {
+			case PictureSetting::Style: return 2;
+			case PictureSetting::Cleanup: return 20;
+			case PictureSetting::Clarity: return 15;
+			case PictureSetting::Vibrance: return 15;
+			case PictureSetting::Deband: return 1;
+			default: return 0;
+			}
+		}
+		static QString PictureSettingKey(PictureSetting s)
+		{
+			static const char *const names[] = { "style", "cleanup", "clarity", "vibrance", "saturation",
+			                                     "contrast", "brightness", "shadows", "temperature", "deband" };
+			return QStringLiteral("settings/picture_") + QLatin1String(names[static_cast<int>(s)]);
+		}
+		int GetPictureSetting(PictureSetting s) const
+		{
+			return qBound(PictureSettingMin(s), settings.value(PictureSettingKey(s), PictureSettingDefault(s)).toInt(),
+			              PictureSettingMax(s));
+		}
+		void SetPictureSetting(PictureSetting s, int value)
+		{
+			settings.setValue(PictureSettingKey(s), qBound(PictureSettingMin(s), value, PictureSettingMax(s)));
+		}
 		void SetSharpening(int percent) { settings.setValue("settings/sharpening", qBound(0, percent, 100)); }
 		int GetFrameGenerationDelay() const { return qBound(0, settings.value("settings/frame_generation_delay", 100).toInt(), 100); }
 		void SetFrameGenerationDelay(int percent) { settings.setValue("settings/frame_generation_delay", qBound(0, percent, 100)); }

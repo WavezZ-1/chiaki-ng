@@ -367,6 +367,9 @@ public:
     void setFrameGenerationDelay(int percent);
     int sharpening() const;
     void setSharpening(int percent);
+    // Picture enhancement, index = PictureSetting.
+    Q_INVOKABLE int pictureSetting(int which) const;
+    Q_INVOKABLE void setPictureSetting(int which, int value);
     bool frameGenerationMarker() const;
     void setFrameGenerationMarker(bool enabled);
     bool frameGenerationControlWindow() const;

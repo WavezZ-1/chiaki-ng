@@ -12,12 +12,21 @@
 //!MAXIMUM 1.0
 0.5
 
+//!PARAM compare
+//!DESC 1 = leave the left half untouched (before/after view)
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
 //!HOOK SCALED
 //!BIND HOOKED
 //!DESC chiaki-ng sharpening
 vec4 hook()
 {
     vec4 center = HOOKED_texOff(vec2(0.0, 0.0));
+    if (compare > 0.5 && HOOKED_pos.x < 0.5)
+        return center;
     vec3 e = center.rgb;
     vec3 b = HOOKED_texOff(vec2(0.0, -1.0)).rgb;
     vec3 d = HOOKED_texOff(vec2(-1.0, 0.0)).rgb;

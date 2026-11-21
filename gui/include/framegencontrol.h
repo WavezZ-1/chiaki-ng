@@ -7,6 +7,8 @@
 
 #include <QWidget>
 
+#include <array>
+
 class QCheckBox;
 class QComboBox;
 class QLabel;
@@ -41,6 +43,15 @@ private:
 	QSlider *sharpen_slider;
 	QLabel *sharpen_value;
 	QLabel *picture_label;
+	// Picture enhancement ("Bild" tab), indexed by PictureSetting.
+	std::array<QSlider *, static_cast<size_t>(PictureSetting::Count)> pic_sliders{};
+	std::array<QLabel *, static_cast<size_t>(PictureSetting::Count)> pic_values{};
+	QComboBox *style_box = nullptr;
+	QCheckBox *deband_box = nullptr;
+	QCheckBox *compare_box = nullptr;
+	QLabel *picture_note = nullptr;
+	void applyPictureStyle(int style);
+	void updatePictureValueLabel(PictureSetting s);
 	QSlider *prediction_slider;
 	QLabel *prediction_value;
 	QSlider *damping_slider;
@@ -55,6 +66,7 @@ private:
 	QLabel *pacer_label;
 	QLabel *game_fps_label;
 	QLabel *stream_fps_label;
+	QLabel *bitrate_label;
 	QLabel *output_fps_label;
 	QLabel *generated_label;
 	QLabel *gpu_label;

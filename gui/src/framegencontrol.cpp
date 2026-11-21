@@ -10,8 +10,10 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QPushButton>
 #include <QShowEvent>
 #include <QSlider>
+#include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -50,6 +52,16 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	setMinimumWidth(360);
 
 	auto *root = new QVBoxLayout(this);
+	// Two tabs: frame generation and picture. The live values stay below both.
+	auto *tabs = new QTabWidget;
+	auto *fg_page = new QWidget;
+	auto *fg_page_layout = new QVBoxLayout(fg_page);
+	fg_page_layout->setContentsMargins(4, 4, 4, 4);
+	auto *pic_page = new QWidget;
+	auto *pic_page_layout = new QVBoxLayout(pic_page);
+	pic_page_layout->setContentsMargins(4, 4, 4, 4);
+	tabs->addTab(fg_page, tr("Frame Generation"));
+	tabs->addTab(pic_page, tr("Bild"));
 
 	// Mode
 	auto *mode_group = new QGroupBox(tr("Modus"));
@@ -73,7 +85,7 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	                          "Verzögerung, verzerrt aber bei schnellen oder plötzlichen Bewegungen. "
 	                          "Gemischt liegt dazwischen."));
 	mode_layout->addWidget(method_box);
-	root->addWidget(mode_group);
+	fg_page_layout->addWidget(mode_group);
 
 	// Tuning
 	auto *tune_group = new QGroupBox(tr("Feineinstellung"));
@@ -131,7 +143,8 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	tune_layout->addRow(marker_box);
 	on_top_box = new QCheckBox(tr("Fenster immer im Vordergrund"));
 	tune_layout->addRow(on_top_box);
-	root->addWidget(tune_group);
+	fg_page_layout->addWidget(tune_group);
+	fg_page_layout->addStretch(1);
 
 	// Picture quality: scaler preset (the same setting as in the video
 	// settings) and sharpening.
@@ -171,7 +184,99 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	picture_label = new QLabel(QStringLiteral("–"));
 	picture_label->setWordWrap(true);
 	quality_layout->addRow(tr("Bild:"), picture_label);
-	root->addWidget(quality_group);
+	pic_page_layout->addWidget(quality_group);
+
+	// Picture enhancement: style presets and the individual controls.
+	auto *enh_group = new QGroupBox(tr("Bildverbesserung"));
+	auto *enh_layout = new QFormLayout(enh_group);
+	style_box = new QComboBox;
+	style_box->addItem(tr("Eigene Einstellung"));
+	style_box->addItem(tr("Aus (Originalbild)"));
+	style_box->addItem(tr("Natürlich"));
+	style_box->addItem(tr("Lebendig"));
+	style_box->addItem(tr("Kino"));
+	style_box->addItem(tr("Dunkle Szenen"));
+	style_box->setToolTip(tr("Fertige Kombinationen aller Regler darunter. Verstellst du danach einen Regler, "
+	                         "wird daraus „Eigene Einstellung“."));
+	enh_layout->addRow(tr("Bildstil:"), style_box);
+
+	struct SliderSpec { PictureSetting s; const char *label; const char *tip; };
+	static const SliderSpec specs[] = {
+		{ PictureSetting::Cleanup, QT_TR_NOOP("Glättung:"),
+		  QT_TR_NOOP("Glättet Blöckchen und Flimmern vom Streaming (Kompression) in flachen und dunklen Flächen, "
+		             "echte Kanten bleiben scharf. Zu viel lässt feine Strukturen wie Laub weicher wirken.") },
+		{ PictureSetting::Clarity, QT_TR_NOOP("Klarheit:"),
+		  QT_TR_NOOP("Mehr Tiefe und Struktur: hebt den Kontrast zwischen größeren Bildbereichen an (wie "
+		             "„Klarheit“ in Fotoprogrammen), ohne feines Rauschen zu verstärken.") },
+		{ PictureSetting::Vibrance, QT_TR_NOOP("Lebendigkeit:"),
+		  QT_TR_NOOP("Kräftigere Farben, aber nur dort, wo sie blass sind – Hauttöne und schon kräftige Farben "
+		             "bleiben natürlich.") },
+		{ PictureSetting::Saturation, QT_TR_NOOP("Sättigung:"),
+		  QT_TR_NOOP("Alle Farben gleichmäßig kräftiger oder blasser.") },
+		{ PictureSetting::Contrast, QT_TR_NOOP("Kontrast:"),
+		  QT_TR_NOOP("Sanfte S-Kurve: Schwarz und Weiß bleiben, dazwischen wird es knackiger (oder flacher).") },
+		{ PictureSetting::Brightness, QT_TR_NOOP("Helligkeit:"),
+		  QT_TR_NOOP("Das ganze Bild heller oder dunkler.") },
+		{ PictureSetting::Shadows, QT_TR_NOOP("Schatten aufhellen:"),
+		  QT_TR_NOOP("Macht dunkle Bereiche sichtbar (Nacht, Innenräume, Clubs), ohne helle Bereiche zu "
+		             "verändern. Viel davon lässt Schwarz etwas grauer wirken.") },
+		{ PictureSetting::Temperature, QT_TR_NOOP("Farbtemperatur:"),
+		  QT_TR_NOOP("Links kühler (bläulich), rechts wärmer (orange).") },
+	};
+	for (const SliderSpec &spec : specs) {
+		const size_t i = static_cast<size_t>(spec.s);
+		auto *slider = new QSlider(Qt::Horizontal);
+		slider->setRange(Settings::PictureSettingMin(spec.s), Settings::PictureSettingMax(spec.s));
+		slider->setSingleStep(5);
+		slider->setPageStep(10);
+		auto *value = new QLabel;
+		value->setMinimumWidth(48);
+		auto *row = new QHBoxLayout;
+		row->addWidget(slider);
+		row->addWidget(value);
+		auto *label = new QLabel(tr(spec.label));
+		label->setToolTip(tr(spec.tip));
+		slider->setToolTip(label->toolTip());
+		enh_layout->addRow(label, row);
+		pic_sliders[i] = slider;
+		pic_values[i] = value;
+		const PictureSetting s = spec.s;
+		connect(slider, &QSlider::valueChanged, this, [this, s](int v) {
+			updatePictureValueLabel(s);
+			if (syncing)
+				return;
+			this->settings->setPictureSetting(static_cast<int>(s), v);
+			this->settings->setPictureSetting(static_cast<int>(PictureSetting::Style), 0);
+		});
+	}
+	deband_box = new QCheckBox(tr("Farbstufen glätten (Debanding)"));
+	deband_box->setToolTip(tr("Entfernt sichtbare Stufen in Farbverläufen wie Himmel, Nebel oder dunklen Wänden."));
+	enh_layout->addRow(deband_box);
+	compare_box = new QCheckBox(tr("Vorher/Nachher: links Original, rechts verbessert"));
+	compare_box->setToolTip(tr("Zum Vergleichen: Die linke Bildhälfte bleibt ohne Bildverbesserung und Schärfung."));
+	enh_layout->addRow(compare_box);
+	picture_note = new QLabel;
+	picture_note->setWordWrap(true);
+	picture_note->setVisible(false);
+	enh_layout->addRow(picture_note);
+	pic_page_layout->addWidget(enh_group);
+	pic_page_layout->addStretch(1);
+	root->addWidget(tabs);
+
+	connect(style_box, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+		if (!syncing)
+			applyPictureStyle(index);
+	});
+	connect(deband_box, &QCheckBox::toggled, this, [this](bool on) {
+		if (syncing)
+			return;
+		this->settings->setPictureSetting(static_cast<int>(PictureSetting::Deband), on ? 1 : 0);
+		this->settings->setPictureSetting(static_cast<int>(PictureSetting::Style), 0);
+	});
+	connect(compare_box, &QCheckBox::toggled, this, [this](bool on) {
+		if (this->window)
+			this->window->setPictureCompare(on);
+	});
 
 	// Live values
 	auto *live_group = new QGroupBox(tr("Live"));
@@ -180,6 +285,8 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	status_label->setWordWrap(true);
 	game_fps_label = valueLabel();
 	stream_fps_label = valueLabel();
+	bitrate_label = valueLabel();
+	bitrate_label->setWordWrap(true);
 	output_fps_label = valueLabel();
 	generated_label = valueLabel();
 	gpu_label = valueLabel();
@@ -191,6 +298,7 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	live_layout->addRow(tr("Bildschirm:"), display_label);
 	live_layout->addRow(tr("Spiel-fps:"), game_fps_label);
 	live_layout->addRow(tr("Stream-fps:"), stream_fps_label);
+	live_layout->addRow(tr("Bitrate:"), bitrate_label);
 	live_layout->addRow(tr("Ausgabe-fps:"), output_fps_label);
 	live_layout->addRow(tr("Davon berechnet:"), generated_label);
 	live_layout->addRow(tr("GPU-Zeit:"), gpu_label);
@@ -238,8 +346,10 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	});
 	connect(sharpen_slider, &QSlider::valueChanged, this, [this](int value) {
 		sharpen_value->setText(value > 0 ? tr("%1 %").arg(value) : tr("aus"));
-		if (!syncing)
+		if (!syncing) {
 			this->settings->setSharpening(value);
+			this->settings->setPictureSetting(static_cast<int>(PictureSetting::Style), 0);
+		}
 	});
 	connect(settings, &QmlSettings::videoPresetChanged, this, &FrameGenControlWindow::syncFromSettings);
 	connect(marker_box, &QCheckBox::toggled, this, [this](bool on) {
@@ -271,6 +381,46 @@ void FrameGenControlWindow::hideEvent(QHideEvent *event)
 	timer->stop();
 }
 
+void FrameGenControlWindow::updatePictureValueLabel(PictureSetting s)
+{
+	const size_t i = static_cast<size_t>(s);
+	if (!pic_sliders[i] || !pic_values[i])
+		return;
+	const int v = pic_sliders[i]->value();
+	if (v == 0)
+		pic_values[i]->setText(tr("aus"));
+	else if (Settings::PictureSettingMin(s) < 0)
+		pic_values[i]->setText(v > 0 ? QStringLiteral("+%1").arg(v) : QStringLiteral("−%1").arg(-v));
+	else
+		pic_values[i]->setText(QStringLiteral("%1 %").arg(v));
+}
+
+void FrameGenControlWindow::applyPictureStyle(int style)
+{
+	// cleanup, clarity, vibrance, saturation, contrast, brightness, shadows,
+	// temperature, deband, sharpening
+	static const int presets[][10] = {
+		{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },          // 1 off
+		{ 20, 15, 15, 0, 0, 0, 0, 0, 1, 30 },      // 2 natural
+		{ 25, 35, 40, 5, 15, 0, 0, 0, 1, 45 },     // 3 vivid
+		{ 25, 20, 10, -5, 20, -5, 0, 15, 1, 25 },  // 4 cinema
+		{ 35, 25, 15, 0, 0, 5, 55, 0, 1, 30 },     // 5 dark scenes
+	};
+	if (style < 1 || style > 5) {
+		settings->setPictureSetting(static_cast<int>(PictureSetting::Style), 0);
+		return;
+	}
+	const int *p = presets[style - 1];
+	const PictureSetting order[] = { PictureSetting::Cleanup, PictureSetting::Clarity, PictureSetting::Vibrance,
+	                                 PictureSetting::Saturation, PictureSetting::Contrast, PictureSetting::Brightness,
+	                                 PictureSetting::Shadows, PictureSetting::Temperature, PictureSetting::Deband };
+	for (int i = 0; i < 9; i++)
+		settings->setPictureSetting(static_cast<int>(order[i]), p[i]);
+	settings->setSharpening(p[9]);
+	settings->setPictureSetting(static_cast<int>(PictureSetting::Style), style);
+	syncFromSettings();
+}
+
 void FrameGenControlWindow::syncFromSettings()
 {
 	syncing = true;
@@ -286,6 +436,14 @@ void FrameGenControlWindow::syncFromSettings()
 	marker_box->setChecked(settings->frameGenerationMarker());
 	scaler_box->setCurrentIndex(qBound(0, settings->videoPreset(), 5));
 	sharpen_slider->setValue(settings->sharpening());
+	for (size_t i = 0; i < pic_sliders.size(); i++) {
+		if (!pic_sliders[i])
+			continue;
+		pic_sliders[i]->setValue(settings->pictureSetting(static_cast<int>(i)));
+		updatePictureValueLabel(static_cast<PictureSetting>(i));
+	}
+	style_box->setCurrentIndex(settings->pictureSetting(static_cast<int>(PictureSetting::Style)));
+	deband_box->setChecked(settings->pictureSetting(static_cast<int>(PictureSetting::Deband)) != 0);
 	sharpen_value->setText(sharpen_slider->value() > 0 ? tr("%1 %").arg(sharpen_slider->value()) : tr("aus"));
 	syncing = false;
 }
@@ -325,6 +483,10 @@ void FrameGenControlWindow::refreshStats()
 
 	mode_box->setItemText(3, tr("Bildschirmrate (%1 Hz)").arg(qRound(info.display_hz)));
 
+	picture_note->setVisible(info.picture_hdr);
+	if (info.picture_hdr)
+		picture_note->setText(tr("HDR-Stream: Klarheit, Farbe und Ton sind für HDR nicht ausgelegt und deshalb aus. "
+		                         "Glättung, Debanding und Schärfe wirken weiter."));
 	if (info.src_w > 0 && info.dst_w > 0) {
 		static const char *const scalers[] = {
 			QT_TR_NOOP("Standard-Skalierung"), QT_TR_NOOP("FSR"),
@@ -362,6 +524,14 @@ void FrameGenControlWindow::refreshStats()
 	};
 	game_fps_label->setText(info.mode ? fps(game_fps) : QStringLiteral("–"));
 	stream_fps_label->setText(info.mode ? fps(stream_fps) : QStringLiteral("–"));
+	if (info.bitrate_mbps > 0.05) {
+		QString text = tr("%1 Mbit/s").arg(info.bitrate_mbps, 0, 'f', 1);
+		if (info.bitrate_mbps < 20.0)
+			text += tr(" – mehr Bitrate in den Stream-Einstellungen = mehr Details");
+		bitrate_label->setText(text);
+	} else {
+		bitrate_label->setText(QStringLiteral("–"));
+	}
 	output_fps_label->setText(fps(output_fps));
 	generated_label->setText(info.mode ? tr("%1 /s").arg(fps(generated_fps)) : QStringLiteral("–"));
 	if (!info.mode || !st.gpu_timers || !sampled)
