@@ -321,43 +321,56 @@ const char *kTileBody = R"(
     ivec2 size = textureSize(fg_mv, 0);
     vec2 stp = vec2(size) / vec2(16.0 * 8.0, 9.0 * 8.0);
     vec2 origin = vec2(tile) * 8.0 * stp + 0.5 * stp;
+    // Load the samples once: comparing them pairwise from registers is cheap,
+    // fetching them again for every pair is not on a real GPU.
+    vec4 v[64];
+    for (int i = 0; i < 64; i++)
+        v[i] = texelFetch(fg_mv, ivec2(origin + vec2(float(i & 7), float(i >> 3)) * stp), 0);
     float best_n = 0.0;
     vec2 best = vec2(0.0);
     for (int i = 0; i < 64; i++) {
-        vec4 a = texelFetch(fg_mv, ivec2(origin + vec2(float(i & 7), float(i >> 3)) * stp), 0);
-        if (fg_bad(a))
+        if (fg_bad(v[i]))
             continue;
-        float tol = 1.5 + 0.05 * length(a.xy);
+        float tol = 1.5 + 0.05 * length(v[i].xy);
         float n = 0.0;
         for (int j = 0; j < 64; j++) {
-            vec4 b = texelFetch(fg_mv, ivec2(origin + vec2(float(j & 7), float(j >> 3)) * stp), 0);
-            if (!fg_bad(b) && length(a.xy - b.xy) < tol)
+            if (!fg_bad(v[j]) && length(v[i].xy - v[j].xy) < tol)
                 n += 1.0;
         }
         if (n > best_n) {
             best_n = n;
-            best = a.xy;
+            best = v[i].xy;
         }
     }
     color = vec4(best, best_n, 0.0);
 )";
 
-const char *kGlobalBody = R"(
-    float best_n = -1.0;
-    vec2 best = vec2(0.0);
-    for (int i = 0; i < 144; i++) {
-        vec4 a = texelFetch(fg_tiles, ivec2(i % 16, i / 16), 0);
-        if (a.z <= 0.0)
-            continue;
+// Support of each tile's vector across all tiles (weighted by how many
+// samples agreed), one tile per invocation so it runs in parallel.
+const char *kSupportBody = R"(
+    ivec2 tile = ivec2(gl_FragCoord.xy);
+    vec4 a = texelFetch(fg_tiles, tile, 0);
+    float n = -1.0;
+    if (a.z > 0.0) {
         float tol = 2.0 + 0.1 * length(a.xy);
-        float n = 0.0;
+        n = 0.0;
         for (int j = 0; j < 144; j++) {
             vec4 b = texelFetch(fg_tiles, ivec2(j % 16, j / 16), 0);
             if (length(a.xy - b.xy) < tol)
                 n += b.z;
         }
-        if (n > best_n) {
-            best_n = n;
+    }
+    color = vec4(a.xy, n, 0.0);
+)";
+
+// The dominant motion: the tile vector with the most support.
+const char *kGlobalBody = R"(
+    float best_n = -1.0;
+    vec2 best = vec2(0.0);
+    for (int i = 0; i < 144; i++) {
+        vec4 a = texelFetch(fg_support, ivec2(i % 16, i / 16), 0);
+        if (a.z > best_n) {
+            best_n = a.z;
             best = a.xy;
         }
     }
@@ -690,10 +703,10 @@ const char *kConfBody = R"(
     vec2 size = vec2(textureSize(fg_mv, 0));
     vec2 tsize = size / vec2(32.0, 18.0);
     vec2 origin = vec2(tile) * tsize;
-    vec2 stp = tsize / 12.0;
+    vec2 stp = tsize / 8.0;
     float em = 0.0, e0 = 0.0, n = 0.0;
-    for (int j = 0; j < 12; j++) {
-        for (int i = 0; i < 12; i++) {
+    for (int j = 0; j < 8; j++) {
+        for (int i = 0; i < 8; i++) {
             vec2 y = origin + (vec2(float(i), float(j)) + 0.5) * stp;
             vec4 f = texelFetch(fg_mv, ivec2(y), 0);
             if (f.z <= 0.02 || f.z >= 0.98)
@@ -705,7 +718,7 @@ const char *kConfBody = R"(
         }
     }
     float w = 0.0;
-    if (n >= 12.0) {
+    if (n >= 6.0) {
         em /= n;
         e0 /= n;
         w = smoothstep(fg_conf_lim.x, fg_conf_lim.y, em / (e0 + 0.002));
@@ -838,6 +851,7 @@ void FrameGenerator::releaseResources()
 	pl_tex_destroy(gpu, &mv_final);
 	pl_tex_destroy(gpu, &mvb_final);
 	pl_tex_destroy(gpu, &tile_tex);
+	pl_tex_destroy(gpu, &support_tex);
 	pl_tex_destroy(gpu, &path_tex);
 	pl_tex_destroy(gpu, &conf_tex);
 	pl_tex_destroy(gpu, &global_tex);
@@ -973,6 +987,7 @@ bool FrameGenerator::ensureResources(const struct pl_frame *src)
 		ok = ok && (mvb_level[l] = make(lw[l], lh[l], fmt_mv, false));
 	ok = ok && (mvb_final = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (tile_tex = make(16, 9, fmt_mv, false));
+	ok = ok && (support_tex = make(16, 9, fmt_mv, false));
 	ok = ok && (path_tex = make(lw[0], lh[0], fmt_mv, false));
 	ok = ok && (conf_tex = make(32, 18, fmt_mv, false));
 	ok = ok && (global_tex = make(1, 1, fmt_mv, false));
@@ -1137,8 +1152,10 @@ bool FrameGenerator::fillPass(pl_tex src, pl_tex dst, int timer)
 	pl_tex global = backward ? global_back_tex : global_tex;
 	if (!runPass(dispatch, "framegen tiles", reliabilityHeader(), kTileBody,
 	             { { "fg_mv", src, false } }, {}, tile_tex, timers[backward ? kTimerTilesBack : kTimerTiles])
+	    || !runPass(dispatch, "framegen support", std::string(), kSupportBody,
+	                { { "fg_tiles", tile_tex, false } }, {}, support_tex, timers[backward ? kTimerSupportBack : kTimerSupport])
 	    || !runPass(dispatch, "framegen global", std::string(), kGlobalBody,
-	                { { "fg_tiles", tile_tex, false } }, {}, global, timers[backward ? kTimerGlobalBack : kTimerGlobal]))
+	                { { "fg_support", support_tex, false } }, {}, global, timers[backward ? kTimerGlobalBack : kTimerGlobal]))
 		return false;
 	// The field's own frame and the frame its vectors point into.
 	const Slot &c = history[cur_slot];

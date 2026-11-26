@@ -65,6 +65,8 @@ struct FrameGenerationInfo
     bool direct_mapping = true;  // display-rate modes need direct frame mapping
     bool paced = false;          // display-rate mode is in effect
     double delay_ms = 0.0;       // how much later than the newest real frame pictures are shown
+    quint64 pacer_arms = 0;      // wake-ups requested (total)
+    bool pacer_running = false;
     int src_w = 0, src_h = 0;    // stream picture
     int dst_w = 0, dst_h = 0;    // size it is shown at
     int upscaler = 0;            // 0 standard scaler, 1 FSR, 2 FSRCNNX 8, 3 FSRCNNX 16

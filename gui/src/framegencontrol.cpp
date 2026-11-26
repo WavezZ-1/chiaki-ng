@@ -478,6 +478,7 @@ void FrameGenControlWindow::refreshStats()
 	const uint64_t fires = delta(info.pacer_fires, last_info.pacer_fires);
 	const uint64_t pace_renders = delta(info.pacer_renders, last_info.pacer_renders);
 	const double fires_per_s = dt > 0.0 ? fires / dt : 0.0;
+	const double arms_per_s = dt > 0.0 ? delta(info.pacer_arms, last_info.pacer_arms) / dt : 0.0;
 	const double late_ms = fires ? delta(info.pacer_late_us, last_info.pacer_late_us) / 1000.0 / fires : 0.0;
 	const double dispatch_ms = pace_renders ? delta(info.pacer_dispatch_us, last_info.pacer_dispatch_us) / 1000.0 / pace_renders : 0.0;
 
@@ -550,8 +551,10 @@ void FrameGenControlWindow::refreshStats()
 	if (!info.paced || !sampled)
 		pacer_label->setText(QStringLiteral("–"));
 	else
-		pacer_label->setText(tr("%1 Weckrufe/s, %2 ms zu spät, %3 ms bis zum Bild")
-		                     .arg(fires_per_s, 0, 'f', 0).arg(late_ms, 0, 'f', 2).arg(dispatch_ms, 0, 'f', 2));
+		pacer_label->setText(tr("%1 Weckrufe/s (%2 angefordert%3), %4 ms zu spät, %5 ms bis zum Bild")
+		                     .arg(fires_per_s, 0, 'f', 0).arg(arms_per_s, 0, 'f', 0)
+		                     .arg(info.pacer_running ? QString() : tr(", Taktgeber läuft nicht"))
+		                     .arg(late_ms, 0, 'f', 2).arg(dispatch_ms, 0, 'f', 2));
 	metric_label->setText(info.mode && info.created
 	                      ? tr("%1 (Schwelle %2)").arg(st.last_metric, 0, 'f', 2)
 	                                               .arg(threshold_slider->value() / 10.0, 0, 'f', 1)

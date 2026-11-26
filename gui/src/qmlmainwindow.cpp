@@ -411,6 +411,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         if (stopping)
             return;
+        stat_arms.fetch_add(1);
         wakeup_target_us = target_wakeup_us;
         armed = true;
         generation.fetch_add(1);
@@ -429,6 +430,7 @@ public:
 
     // Statistics for the control window (monotonic totals).
     quint64 fires() const { return stat_fires.load(); }
+    quint64 arms() const { return stat_arms.load(); }
     quint64 lateUsTotal() const { return stat_late_us.load(); }
 
 protected:
@@ -439,6 +441,7 @@ protected:
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 #endif
         constexpr qint64 kSpinUs = 1500;
+        constexpr qint64 kMaxSleepUs = 2000;
         std::unique_lock<std::mutex> lock(mutex);
         while (!stopping) {
             if (!armed) {
@@ -460,7 +463,9 @@ protected:
                     break;
                 }
                 if (remaining > kSpinUs) {
-                    const qint64 sleep_us = remaining - kSpinUs;
+                    // Sleep in short steps, so a new target (or one that was
+                    // far off) never leaves the thread asleep for long.
+                    const qint64 sleep_us = qMin<qint64>(remaining - kSpinUs, kMaxSleepUs);
 #ifdef Q_OS_WIN
                     if (timer) {
                         LARGE_INTEGER due;
@@ -508,6 +513,7 @@ private:
     qint64 wakeup_target_us = 0;
     std::atomic<quint64> generation{0};
     std::atomic<quint64> stat_fires{0};
+    std::atomic<quint64> stat_arms{0};
     std::atomic<quint64> stat_late_us{0};
 };
 
@@ -6300,6 +6306,8 @@ FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
     info.paced = bypass_frame_queue && info.target_hz > 61.0;
     info.video_presents = fg_video_presents.loadRelaxed();
     info.pacer_fires = fg_pace_thread ? fg_pace_thread->fires() : 0;
+    info.pacer_arms = fg_pace_thread ? fg_pace_thread->arms() : 0;
+    info.pacer_running = fg_pace_thread && fg_pace_thread->isRunning();
     info.pacer_late_us = fg_pace_thread ? fg_pace_thread->lateUsTotal() : 0;
     info.pacer_renders = fg_pace_renders.loadRelaxed();
     info.pacer_dispatch_us = fg_pace_dispatch_us.loadRelaxed();

@@ -152,6 +152,8 @@ private:
 		kTimerGlobal,
 		kTimerTilesBack,
 		kTimerGlobalBack,
+		kTimerSupport,
+		kTimerSupportBack,
 		kTimerAccel,
 		kTimerInterpSmooth,
 		kTimerConf,
@@ -222,6 +224,7 @@ private:
 	pl_tex mv_final = nullptr;
 	pl_tex mvb_final = nullptr;     // backward motion at full detail, for interpolation
 	pl_tex tile_tex = nullptr;      // dominant motion per tile (16x9)
+	pl_tex support_tex = nullptr;   // support of each tile's vector (16x9)
 	pl_tex global_tex = nullptr;    // dominant motion of the whole picture (1x1)
 	pl_tex global_back_tex = nullptr; // the same for the backward field
 	pl_tex path_tex = nullptr;      // interpolation: offset into the previous frame
