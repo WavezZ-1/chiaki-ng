@@ -12,14 +12,17 @@ CHIAKI_EXPORT uint64_t chiaki_time_now_monotonic_us()
 {
 #if _WIN32
 	LARGE_INTEGER f;
-	if(!QueryPerformanceFrequency(&f))
+	if(!QueryPerformanceFrequency(&f) || f.QuadPart <= 0)
 		return 0;
 	LARGE_INTEGER v;
 	if(!QueryPerformanceCounter(&v))
 		return 0;
-	v.QuadPart *= 1000000;
-	v.QuadPart /= f.QuadPart;
-	return v.QuadPart;
+	// Convert in two parts: counter * 1000000 overflows 64 bits after about
+	// 10.7 days of uptime with the usual 10 MHz counter (Fast Startup keeps
+	// the uptime across shutdowns), and the time would turn negative.
+	const uint64_t ticks = (uint64_t)v.QuadPart;
+	const uint64_t freq = (uint64_t)f.QuadPart;
+	return (ticks / freq) * 1000000 + (ticks % freq) * 1000000 / freq;
 #else
 	struct timespec time;
 	clock_gettime(CLOCK_MONOTONIC, &time);
