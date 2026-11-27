@@ -81,6 +81,14 @@ struct FrameGenerationInfo
     quint64 pacer_late_us = 0;   // total lateness of the wake-ups
     quint64 pacer_renders = 0;   // renders that followed a wake-up
     quint64 pacer_dispatch_us = 0; // total time from wake-up to render start
+    quint64 pacer_cpu_us = 0;    // CPU time of the pacer thread so far
+    qint64 pacer_spin_us = 0;    // how long the pacer spins before a wake-up
+    quint64 render_cpu_us = 0;   // CPU time of the render thread so far
+    quint64 process_cpu_us = 0;  // CPU time of the whole program so far
+    int cpu_threads = 1;         // logical CPU cores
+    int decode_path = -1;        // -1 unknown, 0 CPU, 1 GPU + copy through RAM, 2 GPU only
+    QString decode_format;       // e.g. "vulkan", "d3d11", "yuv420p"
+    bool zero_copy = true;       // zero-copy setting in effect
     FrameGeneratorStats stats;
 };
 class DeferredSwapThread;
@@ -353,6 +361,7 @@ private:
     QAtomicInteger<quint64> fg_pace_renders = 0;
     QAtomicInteger<quint64> fg_pace_dispatch_us = 0;
     FrameGenPacerThread *fg_pace_thread = nullptr;
+    std::atomic<quint64> render_cpu_us{0};
     qint64 fg_unique_shown_us = 0; // render thread: when the newest real frame was shown
     float fg_last_factor = 0.0f;
     bool frame_generation_was_enabled = false;

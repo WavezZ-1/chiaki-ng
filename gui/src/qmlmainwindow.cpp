@@ -393,13 +393,59 @@ private:
 #endif
 #endif
 #include <thread>
+#include <algorithm>
+#ifndef Q_OS_WIN
+#include <sys/resource.h>
+#include <time.h>
+#endif
+
+// CPU time used so far by the calling thread / the whole process, in
+// microseconds (for the CPU readout in the control window).
+static quint64 currentThreadCpuUs()
+{
+#ifdef Q_OS_WIN
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
+        return 0;
+    auto to_us = [](const FILETIME &t) {
+        return ((static_cast<quint64>(t.dwHighDateTime) << 32) | t.dwLowDateTime) / 10;
+    };
+    return to_us(kernel) + to_us(user);
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return 0;
+    return static_cast<quint64>(ts.tv_sec) * 1000000 + static_cast<quint64>(ts.tv_nsec) / 1000;
+#endif
+}
+
+static quint64 processCpuUs()
+{
+#ifdef Q_OS_WIN
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+        return 0;
+    auto to_us = [](const FILETIME &t) {
+        return ((static_cast<quint64>(t.dwHighDateTime) << 32) | t.dwLowDateTime) / 10;
+    };
+    return to_us(kernel) + to_us(user);
+#else
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0)
+        return 0;
+    return (static_cast<quint64>(usage.ru_utime.tv_sec) + static_cast<quint64>(usage.ru_stime.tv_sec)) * 1000000
+        + static_cast<quint64>(usage.ru_utime.tv_usec) + static_cast<quint64>(usage.ru_stime.tv_usec);
+#endif
+}
 
 // Wakes the renderer at display-refresh ticks between two real video frames so
 // that frame generation can show its predictions at the full display rate.
 //
 // Ticks are only a few milliseconds apart, so the wait has to be precise: it
 // sleeps until shortly before the target (high-resolution waitable timer on
-// Windows) and then spins for the last stretch.
+// Windows) and then spins for the last stretch. The stretch it spins is only
+// as long as the timer actually overshoots on this machine, because spinning
+// keeps a CPU core busy.
 class FrameGenPacerThread final : public QThread
 {
 public:
@@ -432,6 +478,8 @@ public:
     quint64 fires() const { return stat_fires.load(); }
     quint64 arms() const { return stat_arms.load(); }
     quint64 lateUsTotal() const { return stat_late_us.load(); }
+    quint64 cpuUs() const { return stat_cpu_us.load(); }
+    qint64 spinUs() const { return stat_spin_margin_us.load(); }
 
 protected:
     void run() override
@@ -440,8 +488,18 @@ protected:
         timeBeginPeriod(1);
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 #endif
-        constexpr qint64 kSpinUs = 1500;
+        constexpr qint64 kMinSpinUs = 200;
+        constexpr qint64 kMaxSpinUs = 2000;
         constexpr qint64 kMaxSleepUs = 2000;
+        // How far the timer overshoots its sleeps: the spin covers 99 % of the
+        // recent overshoots. Rare long stalls (the thread not being scheduled)
+        // are not covered, because spinning would not help against them
+        // either. Starts cautious and settles within a second.
+        constexpr int kSamples = 256;
+        std::array<int, kSamples> overshoots{};
+        int overshoot_count = 0;
+        int since_update = 0;
+        qint64 spin_us = 1500;
         std::unique_lock<std::mutex> lock(mutex);
         while (!stopping) {
             if (!armed) {
@@ -462,21 +520,36 @@ protected:
                     superseded = true;
                     break;
                 }
-                if (remaining > kSpinUs) {
+                if (remaining > spin_us) {
                     // Sleep in short steps, so a new target (or one that was
                     // far off) never leaves the thread asleep for long.
-                    const qint64 sleep_us = qMin<qint64>(remaining - kSpinUs, kMaxSleepUs);
+                    const qint64 sleep_us = qMin<qint64>(remaining - spin_us, kMaxSleepUs);
+                    bool slept = false;
 #ifdef Q_OS_WIN
                     if (timer) {
                         LARGE_INTEGER due;
                         due.QuadPart = -static_cast<LONGLONG>(sleep_us) * 10; // relative, 100 ns units
                         if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
                             WaitForSingleObject(timer, INFINITE);
-                            continue;
+                            slept = true;
                         }
                     }
 #endif
-                    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+                    if (!slept)
+                        std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+                    const qint64 woke_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+                    overshoots[overshoot_count % kSamples] =
+                        static_cast<int>(qBound(qint64(-100000), woke_us - now_us - sleep_us, qint64(100000)));
+                    overshoot_count++;
+                    if (++since_update >= 32 && overshoot_count >= 64) {
+                        since_update = 0;
+                        const int n = qMin(overshoot_count, kSamples);
+                        std::array<int, kSamples> sorted = overshoots;
+                        const int k = n * 99 / 100;
+                        std::nth_element(sorted.begin(), sorted.begin() + k, sorted.begin() + n);
+                        spin_us = qBound<qint64>(kMinSpinUs, sorted[k] + 200, kMaxSpinUs);
+                        stat_spin_margin_us.store(spin_us);
+                    }
                 } else {
                     std::this_thread::yield();
                 }
@@ -492,6 +565,7 @@ protected:
             const qint64 fired_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
             stat_fires.fetch_add(1);
             stat_late_us.fetch_add(static_cast<quint64>(qMax<qint64>(0, fired_us - target)));
+            stat_cpu_us.store(currentThreadCpuUs());
             if (owner)
                 owner->requestFrameGenerationRender(fired_us);
             lock.lock();
@@ -515,6 +589,8 @@ private:
     std::atomic<quint64> stat_fires{0};
     std::atomic<quint64> stat_arms{0};
     std::atomic<quint64> stat_late_us{0};
+    std::atomic<quint64> stat_cpu_us{0};
+    std::atomic<qint64> stat_spin_margin_us{1500};
 };
 
 class BufferedPlaybackPacerThread final : public QThread
@@ -6309,6 +6385,18 @@ FrameGenerationInfo QmlMainWindow::frameGenerationInfo() const
     info.pacer_arms = fg_pace_thread ? fg_pace_thread->arms() : 0;
     info.pacer_running = fg_pace_thread && fg_pace_thread->isRunning();
     info.pacer_late_us = fg_pace_thread ? fg_pace_thread->lateUsTotal() : 0;
+    info.pacer_cpu_us = fg_pace_thread ? fg_pace_thread->cpuUs() : 0;
+    info.pacer_spin_us = fg_pace_thread ? fg_pace_thread->spinUs() : 0;
+    info.render_cpu_us = render_cpu_us.load();
+    info.process_cpu_us = processCpuUs();
+    info.cpu_threads = qMax(1, QThread::idealThreadCount());
+    if (backend) {
+        info.decode_path = backend->decodePath();
+        const int format = backend->decodeFormat();
+        const char *name = format >= 0 ? av_get_pix_fmt_name(static_cast<AVPixelFormat>(format)) : nullptr;
+        info.decode_format = name ? QString::fromLatin1(name) : QString();
+        info.zero_copy = backend->zeroCopy();
+    }
     info.pacer_renders = fg_pace_renders.loadRelaxed();
     info.pacer_dispatch_us = fg_pace_dispatch_us.loadRelaxed();
     FrameGenerator *fg = frame_generator.load();
@@ -6970,6 +7058,7 @@ void QmlMainWindow::render()
     }
     const qint64 render_entry_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     last_render_entry_us.storeRelease(render_entry_us);
+    render_cpu_us.store(currentThreadCpuUs());
     render_pending_during_cycle.storeRelaxed(0);
     const qint64 schedule_us = last_schedule_update_us.loadAcquire();
     if (schedule_us > 0 && render_entry_us >= schedule_us)

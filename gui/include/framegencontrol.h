@@ -64,6 +64,8 @@ private:
 	QLabel *status_label;
 	QLabel *display_label;
 	QLabel *pacer_label;
+	QLabel *cpu_label;
+	QLabel *decode_label;
 	QLabel *game_fps_label;
 	QLabel *stream_fps_label;
 	QLabel *bitrate_label;

@@ -294,6 +294,10 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	display_label = valueLabel();
 	pacer_label = valueLabel();
 	pacer_label->setWordWrap(true);
+	cpu_label = valueLabel();
+	cpu_label->setWordWrap(true);
+	decode_label = valueLabel();
+	decode_label->setWordWrap(true);
 	live_layout->addRow(tr("Status:"), status_label);
 	live_layout->addRow(tr("Bildschirm:"), display_label);
 	live_layout->addRow(tr("Spiel-fps:"), game_fps_label);
@@ -304,6 +308,8 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	live_layout->addRow(tr("GPU-Zeit:"), gpu_label);
 	live_layout->addRow(tr("Bildunterschied:"), metric_label);
 	live_layout->addRow(tr("Taktgeber:"), pacer_label);
+	live_layout->addRow(tr("CPU:"), cpu_label);
+	live_layout->addRow(tr("Dekodierung:"), decode_label);
 	root->addWidget(live_group);
 
 	hint_label = new QLabel;
@@ -551,10 +557,49 @@ void FrameGenControlWindow::refreshStats()
 	if (!info.paced || !sampled)
 		pacer_label->setText(QStringLiteral("–"));
 	else
-		pacer_label->setText(tr("%1 Weckrufe/s (%2 angefordert%3), %4 ms zu spät, %5 ms bis zum Bild")
+		pacer_label->setText(tr("%1 Weckrufe/s (%2 angefordert%3), %4 ms zu spät, %5 ms bis zum Bild, "
+		                        "%6 ms aktives Warten")
 		                     .arg(fires_per_s, 0, 'f', 0).arg(arms_per_s, 0, 'f', 0)
 		                     .arg(info.pacer_running ? QString() : tr(", Taktgeber läuft nicht"))
-		                     .arg(late_ms, 0, 'f', 2).arg(dispatch_ms, 0, 'f', 2));
+		                     .arg(late_ms, 0, 'f', 2).arg(dispatch_ms, 0, 'f', 2)
+		                     .arg(info.pacer_spin_us / 1000.0, 0, 'f', 2));
+
+	// Shares of the whole CPU, like the Task Manager shows them.
+	if (sampled && last_info.process_cpu_us > 0) {
+		const double cores = qMax(1, info.cpu_threads);
+		auto share = [dt, cores](quint64 now, quint64 before) {
+			return delta(now, before) / 1e6 / dt / cores * 100.0;
+		};
+		QString text = tr("%1 % gesamt").arg(share(info.process_cpu_us, last_info.process_cpu_us), 0, 'f', 1);
+		text += tr(" – Bildausgabe %1 %").arg(share(info.render_cpu_us, last_info.render_cpu_us), 0, 'f', 1);
+		if (info.paced)
+			text += tr(", Taktgeber %1 %").arg(share(info.pacer_cpu_us, last_info.pacer_cpu_us), 0, 'f', 1);
+		text += tr(" (Rest: Videodekodierung, Ton, Netzwerk)");
+		cpu_label->setText(text);
+	} else {
+		cpu_label->setText(QStringLiteral("–"));
+	}
+	switch (info.decode_path) {
+	case 2:
+		decode_label->setText(tr("Grafikkarte (%1), das Bild bleibt komplett auf der GPU").arg(info.decode_format));
+		break;
+	case 1:
+		if (info.decode_format == QLatin1String("vulkan") && !info.zero_copy)
+			decode_label->setText(tr("Grafikkarte (vulkan), aber jedes Bild macht einen Umweg über den Arbeitsspeicher. "
+			                         "Einstellungen → Video: „Zero-Copy“ einschalten spart CPU."));
+		else
+			decode_label->setText(tr("Grafikkarte (%1), aber jedes Bild macht einen Umweg über den Arbeitsspeicher. "
+			                         "Einstellungen → Video: Hardware Decoder „vulkan“ und „Zero-Copy“ spart CPU.")
+			                      .arg(info.decode_format));
+		break;
+	case 0:
+		decode_label->setText(tr("Prozessor (Software), kostet viel CPU. Einstellungen → Video: Hardware Decoder "
+		                         "„auto“ oder „vulkan“ und „Zero-Copy“ an."));
+		break;
+	default:
+		decode_label->setText(QStringLiteral("–"));
+		break;
+	}
 	metric_label->setText(info.mode && info.created
 	                      ? tr("%1 (Schwelle %2)").arg(st.last_metric, 0, 'f', 2)
 	                                               .arg(threshold_slider->value() / 10.0, 0, 'f', 1)

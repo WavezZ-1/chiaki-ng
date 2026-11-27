@@ -461,10 +461,14 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_
     if (frame.frame->format == AV_PIX_FMT_NONE)
         return false;
 
-    if (!frame.frame->hw_frames_ctx)
+    decode_format.storeRelaxed(frame.frame->format);
+    if (!frame.frame->hw_frames_ctx) {
+        decode_path.storeRelaxed(0);
         return frame_has_planes(frame.frame);
+    }
 
     const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, use_opengl_renderer);
+    decode_path.storeRelaxed(direct_render ? 2 : 1);
     if (direct_render)
         return frame_has_planes(frame.frame);
 

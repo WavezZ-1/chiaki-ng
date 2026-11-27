@@ -181,6 +181,12 @@ public:
     bool zeroCopy()        { return !disable_zero_copy; };
     void disableZeroCopy() { disable_zero_copy = true; };
     void enableZeroCopy()  { disable_zero_copy = false; };
+    // How the newest video frame was decoded (for the frame generation
+    // control window): -1 unknown, 0 by the CPU, 1 by the GPU but copied
+    // through system memory, 2 by the GPU and kept on it. decodeFormat() is
+    // the AVPixelFormat of the decoded frame.
+    int decodePath() const { return decode_path.loadRelaxed(); }
+    int decodeFormat() const { return decode_format.loadRelaxed(); }
 
     Q_INVOKABLE void deleteHost(int index);
     Q_INVOKABLE void showFrameGenerationControl();
@@ -317,6 +323,8 @@ private:
     QFutureWatcher<void> psn_hosts_watcher;
     QFuture<void> psn_hosts_future;
     bool disable_zero_copy = false;
+    QAtomicInteger<int> decode_path = -1;
+    QAtomicInteger<int> decode_format = -1;
     QMutex hw_transfer_state_mutex;
     QSet<int> logged_hw_transfer_formats;
     QSet<int> logged_hw_transfer_failures;
