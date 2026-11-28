@@ -81,7 +81,7 @@ FrameGenControlWindow::FrameGenControlWindow(QmlSettings *settings, QmlMainWindo
 	method_box->addItem(tr("Vorhersage – keine Verzögerung"));
 	method_box->setToolTip(tr("Zwischenbilder werden zwischen zwei echten Bildern berechnet: auch bei "
 	                          "schnellen Drehungen und ruckartigen Animationen sauber, dafür erscheint das "
-	                          "Bild knapp ein Spielbild später. Die Vorhersage rät das nächste Bild ohne "
+	                          "Bild ein Spielbild später. Die Vorhersage rät das nächste Bild ohne "
 	                          "Verzögerung, verzerrt aber bei schnellen oder plötzlichen Bewegungen. "
 	                          "Gemischt liegt dazwischen."));
 	mode_layout->addWidget(method_box);

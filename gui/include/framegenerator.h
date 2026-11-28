@@ -99,6 +99,12 @@ public:
 	// Available whenever canPredict() is true.
 	bool interpolate(const struct pl_frame *meta, float t, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out);
 
+	// Estimates the motion between the two newest frames right away (otherwise
+	// it runs with the first generated picture). With `backward` also the
+	// backward field that interpolate() needs. Returns false if no picture
+	// can be generated for this pair.
+	bool prepareMotion(bool backward);
+
 	// Average time between two game frames in seconds (from the pts of new
 	// frames), or 0 if not known yet.
 	double gameFrameInterval() const { return frame_interval; }

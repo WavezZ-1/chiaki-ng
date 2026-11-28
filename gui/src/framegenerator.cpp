@@ -1369,6 +1369,30 @@ void FrameGenerator::finishOutput(const struct pl_frame *src, pl_tex out_tex[PL_
 	out->repr.dovi = nullptr;
 }
 
+bool FrameGenerator::prepareMotion(bool backward)
+{
+	if (!canPredict())
+		return false;
+	if (motion_pending) {
+		motion_valid = estimateMotion();
+		motion_pending = false;
+		if (!motion_valid) {
+			recordFailure();
+			return false;
+		}
+	}
+	if (!motion_valid)
+		return false;
+	if (backward && !backward_valid) {
+		backward_valid = estimateBackward();
+		if (!backward_valid) {
+			recordFailure();
+			return false;
+		}
+	}
+	return true;
+}
+
 bool FrameGenerator::interpolate(const struct pl_frame *meta, float t, pl_tex out_tex[PL_MAX_PLANES], struct pl_frame *out)
 {
 	if (!meta || !out_tex || !out || !canPredict())

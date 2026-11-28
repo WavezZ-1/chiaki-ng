@@ -362,7 +362,19 @@ private:
     QAtomicInteger<quint64> fg_pace_dispatch_us = 0;
     FrameGenPacerThread *fg_pace_thread = nullptr;
     std::atomic<quint64> render_cpu_us{0};
-    qint64 fg_unique_shown_us = 0; // render thread: when the newest real frame was shown
+    qint64 fg_unique_shown_us = 0; // render thread: when the newest real frame arrived
+    // Display-rate grid (render thread): ticks at fg_grid_origin_us + n * fg_grid_tick_us
+    qint64 fg_grid_origin_us = 0;  // 0 = not running
+    double fg_grid_tick_us = 0.0;
+    double fg_grid_last_tick = 0.0;
+    bool fg_tick_generated = false; // the last tick showed a generated picture
+    qint64 fg_pending_arrival_us = 0; // a real frame that arrived early waits (0 = none)
+    // Smoothed times of the two newest real frames (render thread)
+    double fg_tl_prev_us = 0.0;
+    double fg_tl_cur_us = 0.0;
+    double fg_tl_interval_us = 0.0; // steady game frame time for the pacing
+    double fg_tl_bias_us = 0.0;     // recent arrival errors (a lasting one = the frame rate changed)
+    bool fg_tl_valid = false;
     float fg_last_factor = 0.0f;
     bool frame_generation_was_enabled = false;
     std::array<pl_tex, PL_MAX_PLANES> fg_direct_tex{};
@@ -383,9 +395,13 @@ private:
     FrameGenerator *ensureFrameGenerator(pl_gpu gpu);
     // Returns true when the render has nothing new to show and can skip presenting.
     bool handleDirectFrameGeneration(bool new_mapping, qint64 now_us);
-    void armFrameGenPacer(qint64 now_us, double min_next_tick = 1.0);
+    void armFrameGenPacer(qint64 now_us);
+    void stopFrameGenGrid();
+    void updateFrameGenTimeline(FrameGenerator *fg, qint64 arrival_us);
+    double frameGenGridInterval(FrameGenerator *fg) const;
+    int takeFrameGenArrival(FrameGenerator *fg, qint64 arrival_us, double target_hz);
     double frameGenerationDelaySeconds(double interval, double target_hz) const;
-    bool showFrameGenerationTick(FrameGenerator *fg, double tick, double target_hz);
+    bool showFrameGenerationTick(FrameGenerator *fg, double tick_time_us, double target_hz);
     uint64_t ts_start = 0;
     double queue_pts_origin = -1.0;
     double newest_queued_frame_pts = -1.0;

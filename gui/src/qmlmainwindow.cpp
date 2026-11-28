@@ -6183,11 +6183,14 @@ FrameGenerator *QmlMainWindow::ensureFrameGenerator(pl_gpu gpu)
         if (frame_generation_was_enabled && fg)
             fg->reset();
         frame_generation_was_enabled = false;
-        fg_unique_shown_us = 0;
+        stopFrameGenGrid();
         return nullptr;
     }
-    if (!frame_generation_was_enabled && fg)
-        fg->reset();
+    if (!frame_generation_was_enabled) {
+        if (fg)
+            fg->reset();
+        stopFrameGenGrid();
+    }
     frame_generation_was_enabled = true;
 
     if (!fg) {
@@ -6228,7 +6231,7 @@ bool QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
     const double target_hz = frameGenerationTargetHz(frame_generation_mode.loadAcquire());
     if (target_hz <= 61.0) {
         // 60 fps mode: only repeated stream frames are replaced.
-        fg_unique_shown_us = 0;
+        stopFrameGenGrid();
         if (new_mapping) {
             fg_direct_frame_valid = applyFrameGeneration(gpu, &direct_frame, static_cast<double>(now_us) / 1e6,
                                                          fg_direct_tex.data(), &fg_direct_frame);
@@ -6236,30 +6239,50 @@ bool QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
         return false;
     }
 
-    // Display-rate mode. The picture shown at time `now` belongs to the game
-    // time `now - delay`: with no delay every picture after a real frame is a
-    // prediction; with a delay the generator interpolates between the two
-    // newest real frames, which needs no guessing. Ticks are counted from the
-    // arrival of the newest real frame. Direct mapping never re-submits a
-    // frame, so the arrival time serves as pts.
+    // Display-rate mode. Pictures are shown on a fixed grid of display-rate
+    // ticks that keeps running no matter when real frames arrive, so the
+    // output reaches the display rate although the stream's frames arrive
+    // unevenly (network) or the game drops below its frame rate. The picture
+    // of a tick at time T belongs to the game time T - delay on a smoothed
+    // timeline of the real frames: between the two newest real frames it is
+    // interpolated, past the newest one (a real frame is late, or the delay
+    // is short) it is predicted. Direct mapping never re-submits a frame, so
+    // the arrival time serves as pts.
     FrameGenerator *fg = ensureFrameGenerator(gpu);
     if (!fg) {
         fg_direct_frame_valid = false;
+        stopFrameGenGrid();
         return false;
     }
+    const double tick_us = 1e6 / target_hz;
+    if (fg_grid_origin_us != 0 && qAbs(fg_grid_tick_us - tick_us) > 0.01)
+        stopFrameGenGrid(); // the rate changed: start a new grid
     if (new_mapping) {
-        bool is_new = true;
-        const bool analysed = fg->analyze(&direct_frame, static_cast<double>(now_us) / 1e6, &is_new);
-        if (!analysed || is_new) {
-            fg_unique_shown_us = now_us;
-            fg_pace_fired_us.store(0);
-            fg_last_factor = -1.0f;
-            fg_direct_frame_valid = false;
-            if (analysed)
-                showFrameGenerationTick(fg, 0.0, target_hz);
-            armFrameGenPacer(now_us);
-            return false;
+        // A real frame that arrives earlier than the grid needs it is taken
+        // in only when a tick needs it: until then the ticks still need the
+        // previous pair of frames, which taking it in would replace.
+        if (fg_grid_origin_us != 0 && fg_tl_valid && fg_pending_arrival_us == 0) {
+            const double interval = frameGenGridInterval(fg);
+            const double next_tick = qMax(std::floor(static_cast<double>(now_us - fg_grid_origin_us) / tick_us + 0.5),
+                                          fg_grid_last_tick + 1.0);
+            const double next_game_us = static_cast<double>(fg_grid_origin_us) + next_tick * tick_us
+                - frameGenerationDelaySeconds(interval, target_hz) * 1e6;
+            if (next_game_us < fg_tl_cur_us - 0.02 * interval * 1e6) {
+                fg_pending_arrival_us = now_us;
+                fg_direct_frame_valid = fg_tick_generated; // keep the picture
+                armFrameGenPacer(now_us);
+                return true;
+            }
         }
+        // A frame still waiting is replaced by this one (rare: two frames
+        // within one tick).
+        fg_pending_arrival_us = 0;
+        const int taken = takeFrameGenArrival(fg, now_us, target_hz);
+        if (taken == 0)
+            return false; // show the real frame now
+        if (taken == 1)
+            return true;
+        // A repeated stream frame: nothing new, handled like any other render.
     }
     const qint64 fired_us = fg_pace_fired_us.exchange(0);
     const bool pacer_tick = fired_us > 0;
@@ -6267,93 +6290,219 @@ bool QmlMainWindow::handleDirectFrameGeneration(bool new_mapping, qint64 now_us)
         fg_pace_renders.fetchAndAddRelaxed(1);
         fg_pace_dispatch_us.fetchAndAddRelaxed(static_cast<quint64>(now_us - fired_us));
     }
-    if (fg_unique_shown_us <= 0 || fg->gameFrameInterval() <= 0.0 || !fg->canPredict() || !fg_pace_thread)
+    if (fg_grid_origin_us == 0 || !fg_tl_valid || fg->gameFrameInterval() <= 0.0 || !fg->canPredict() || !fg_pace_thread)
         return false;
+    if (new_mapping)
+        fg_direct_frame_valid = fg_tick_generated; // a repeated stream frame: keep the picture
     // Only pacer ticks change the picture. A repeated stream frame or a render
     // for another reason shows nothing new; presenting it anyway would put an
-    // extra frame between the ticks (uneven frame times) and could push the
-    // next tick back by one refresh. render() still presents if the UI changed.
+    // extra frame between the ticks (uneven frame times). render() still
+    // presents if the UI changed.
     if (!pacer_tick)
         return true;
-    // The tick this render belongs to, so the steps between the pictures stay
-    // equal even if the render runs a little late.
-    const double tick_us = 1e6 / target_hz;
-    const double tick = std::floor(static_cast<double>(now_us - fg_unique_shown_us) / tick_us + 0.5);
-    if (tick < 1.0)
-        return true; // stale tick from before the newest real frame
-    const bool changed = showFrameGenerationTick(fg, tick, target_hz);
-    armFrameGenPacer(now_us, tick + 1.0);
+    // The tick this render belongs to; its picture is for the tick's own time,
+    // so the steps between the pictures stay equal even if the render runs a
+    // little late.
+    const double tick = std::floor(static_cast<double>(now_us - fg_grid_origin_us) / tick_us + 0.5);
+    if (tick <= fg_grid_last_tick) {
+        armFrameGenPacer(now_us);
+        return true; // already shown
+    }
+    fg_grid_last_tick = tick;
+    const double tick_time_us = static_cast<double>(fg_grid_origin_us) + tick * tick_us;
+    if (fg_pending_arrival_us != 0) {
+        const double interval = frameGenGridInterval(fg);
+        const double game_us = tick_time_us - frameGenerationDelaySeconds(interval, target_hz) * 1e6;
+        if (game_us >= fg_tl_cur_us - 0.02 * interval * 1e6) {
+            // This tick needs the frame that arrived early: take it in now.
+            const qint64 arrival_us = fg_pending_arrival_us;
+            fg_pending_arrival_us = 0;
+            if (takeFrameGenArrival(fg, arrival_us, target_hz) == 0)
+                return false; // the grid stopped: show the real frame
+        }
+    }
+    const bool changed = showFrameGenerationTick(fg, tick_time_us, target_hz);
+    armFrameGenPacer(now_us);
     return !changed;
+}
+
+int QmlMainWindow::takeFrameGenArrival(FrameGenerator *fg, qint64 arrival_us, double target_hz)
+{
+    // Analyses the mapped real frame (direct_frame) that arrived at
+    // `arrival_us`. Returns 0 if it is to be shown as it is now (the grid is
+    // not running), 1 if the grid shows it, 2 if it repeats the previous one.
+    bool is_new = true;
+    if (!fg->analyze(&direct_frame, static_cast<double>(arrival_us) / 1e6, &is_new)) {
+        fg_direct_frame_valid = false;
+        stopFrameGenGrid();
+        return 0;
+    }
+    if (!is_new)
+        return 2;
+    fg_unique_shown_us = arrival_us;
+    updateFrameGenTimeline(fg, arrival_us);
+    const double interval = frameGenGridInterval(fg);
+    const bool interpolating = frameGenerationDelaySeconds(interval, target_hz) > 0.0;
+    // Estimate the motion right away, before the tick that shows it.
+    const bool ready = fg_pace_thread && fg_tl_valid && interval > 0.0 && fg->canPredict()
+        && fg->prepareMotion(interpolating);
+    pl_gpu_flush(placeboGpu());
+    fg_last_factor = -1.0f; // the next tick renders, as the frame pair changed
+    if (!ready || fg_grid_origin_us == 0) {
+        // The grid is not running (yet): show this real frame now and start
+        // the grid here.
+        fg_direct_frame_valid = false;
+        if (ready) {
+            const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+            fg_grid_origin_us = now_us;
+            fg_grid_tick_us = 1e6 / target_hz;
+            fg_grid_last_tick = 0.0;
+            fg_tick_generated = false;
+            armFrameGenPacer(now_us);
+        } else {
+            stopFrameGenGrid();
+        }
+        return 0;
+    }
+    // The ticks show the new frame. Until then the screen keeps the last
+    // tick's picture (also if this render presents for the UI).
+    fg_direct_frame_valid = fg_tick_generated;
+    armFrameGenPacer(static_cast<qint64>(chiaki_time_now_monotonic_us())); // in case the pacer was holding
+    return 1;
+}
+
+void QmlMainWindow::stopFrameGenGrid()
+{
+    fg_grid_origin_us = 0;
+    fg_grid_last_tick = 0.0;
+    fg_unique_shown_us = 0;
+    fg_tl_valid = false;
+    fg_tick_generated = false;
+    fg_pending_arrival_us = 0;
+}
+
+void QmlMainWindow::updateFrameGenTimeline(FrameGenerator *fg, qint64 arrival_us)
+{
+    // Times of the two newest real frames on an even timeline. Frames of a
+    // steady game come at even steps, but arrive unevenly through the
+    // network; following the arrival times would make the motion uneven. So
+    // the timeline follows the arrivals only slowly, with its own steady
+    // estimate of the game's frame time, unless the errors keep pointing the
+    // same way: then the game's frame rate changed, and it follows quickly.
+    const double measured_us = fg->gameFrameInterval() * 1e6;
+    const double a = static_cast<double>(arrival_us);
+    if (!fg_tl_valid || measured_us <= 0.0 || fg_tl_interval_us <= 0.0 || a < fg_tl_cur_us
+        || a - fg_tl_cur_us > 4.0 * fg_tl_interval_us) {
+        fg_tl_interval_us = measured_us;
+        fg_tl_cur_us = a;
+        fg_tl_prev_us = a - measured_us;
+        fg_tl_valid = measured_us > 0.0;
+        fg_tl_bias_us = 0.0;
+        return;
+    }
+    const double interval_us = fg_tl_interval_us;
+    // A game frame that looked like a repeat makes a gap of two frames.
+    const double frames = qMax(1.0, std::round((a - fg_tl_cur_us) / interval_us));
+    const double expected = fg_tl_cur_us + frames * interval_us;
+    const double error = a - expected;
+    fg_tl_bias_us = 0.7 * fg_tl_bias_us + 0.3 * error;
+    const bool rate_changed = qAbs(fg_tl_bias_us) > 0.08 * interval_us;
+    fg_tl_prev_us = fg_tl_cur_us;
+    if (qAbs(error) > 0.5 * interval_us) {
+        fg_tl_cur_us = a;
+        fg_tl_interval_us = measured_us;
+        return;
+    }
+    fg_tl_cur_us = expected + (rate_changed ? 0.3 : 0.05) * error;
+    fg_tl_interval_us += (rate_changed ? 0.08 : 0.01) * error / frames;
 }
 
 double QmlMainWindow::frameGenerationDelaySeconds(double interval, double target_hz) const
 {
     if (interval <= 0.0 || target_hz <= 0.0)
         return 0.0;
-    // At most one game frame minus one output frame: then the newest real
-    // frame is reached exactly when the next one is due.
-    return fg_delay.load() * qMax(0.0, interval - 1.0 / target_hz);
+    // With one whole game frame of delay every tick lies between two real
+    // frames that have already arrived (as long as they are on time), so
+    // every picture is interpolated.
+    return fg_delay.load() * interval;
 }
 
-bool QmlMainWindow::showFrameGenerationTick(FrameGenerator *fg, double tick, double target_hz)
+double QmlMainWindow::frameGenGridInterval(FrameGenerator *fg) const
 {
-    const double interval = fg->gameFrameInterval();
-    if (interval <= 0.0 || !fg->canPredict()) {
+    return fg_tl_valid && fg_tl_interval_us > 0.0 ? fg_tl_interval_us / 1e6 : fg->gameFrameInterval();
+}
+
+bool QmlMainWindow::showFrameGenerationTick(FrameGenerator *fg, double tick_time_us, double target_hz)
+{
+    const double interval = frameGenGridInterval(fg);
+    if (interval <= 0.0 || !fg->canPredict() || !fg_tl_valid) {
         const bool changed = fg_direct_frame_valid;
         fg_direct_frame_valid = false;
+        fg_tick_generated = false;
         return changed;
     }
-    const double delay = frameGenerationDelaySeconds(interval, target_hz);
-    // Position between the previous (0) and the newest (1) real frame; above 1
-    // it is a prediction beyond the newest frame.
-    const double t = 1.0 + (tick / target_hz - delay) / interval;
+    // Game time of this tick and its place between the previous (0) and the
+    // newest (1) real frame; above 1 it is a prediction beyond the newest.
+    const double game_us = tick_time_us - frameGenerationDelaySeconds(interval, target_hz) * 1e6;
+    const double span_us = qMax(1.0, fg_tl_cur_us - fg_tl_prev_us);
+    const double t = (game_us - fg_tl_prev_us) / span_us;
     float position;
     bool predicted;
-    if (t < 0.98) {
+    if (fg_pending_arrival_us != 0) {
+        // direct_frame already holds a newer frame than the pair: the picture
+        // has to come from the generator.
+        position = static_cast<float>(qBound(0.0, t, 1.0));
+        predicted = true;
+    } else if (t < 0.98) {
         position = static_cast<float>(qMax(0.0, t));
         predicted = true;
     } else {
-        const double ahead = qMin<double>(t - 1.0, fg_max_prediction.load());
+        const double ahead = qMin<double>((game_us - fg_tl_cur_us) / (interval * 1e6), fg_max_prediction.load());
         predicted = ahead >= 0.04;
         position = predicted ? static_cast<float>(1.0 + ahead) : 1.0f;
     }
-    if (qAbs(position - fg_last_factor) <= 1e-4f && fg_direct_frame_valid == predicted)
+    if (qAbs(position - fg_last_factor) <= 1e-4f && fg_tick_generated == predicted) {
+        fg_direct_frame_valid = fg_tick_generated;
         return false; // the same picture as now
+    }
     fg_last_factor = position;
     if (!predicted) {
         fg_direct_frame_valid = false;
+        fg_tick_generated = false;
         return true;
     }
     if (position < 1.0f)
         fg_direct_frame_valid = fg->interpolate(&direct_frame, position, fg_direct_tex.data(), &fg_direct_frame);
     else
         fg_direct_frame_valid = fg->predict(&direct_frame, position - 1.0f, fg_direct_tex.data(), &fg_direct_frame);
+    fg_tick_generated = fg_direct_frame_valid;
     return true;
 }
 
-void QmlMainWindow::armFrameGenPacer(qint64 now_us, double min_next_tick)
+void QmlMainWindow::armFrameGenPacer(qint64 now_us)
 {
     FrameGenerator *fg = frame_generator.load();
     const double target_hz = frameGenerationTargetHz(frame_generation_mode.loadAcquire());
-    if (!fg_pace_thread || !fg || fg_unique_shown_us <= 0 || target_hz <= 61.0)
+    if (!fg_pace_thread || !fg || fg_grid_origin_us == 0 || !fg_tl_valid || target_hz <= 61.0)
         return;
-    const double interval = fg->gameFrameInterval();
+    const double interval = frameGenGridInterval(fg);
     if (interval <= 0.0)
         return;
-    // Ticks are aligned to the arrival of the newest real frame.
     const double tick_us = 1e6 / target_hz;
-    const double elapsed_us = static_cast<double>(now_us - fg_unique_shown_us);
-    // Never the tick that was just shown, even if its render ran late.
-    const double next_tick = qMax(std::floor(elapsed_us / tick_us) + 1.0, min_next_tick);
-    const double next_rel_s = next_tick * tick_us / 1e6;
-    // The next real frame is due one interval after the newest and renders by
-    // itself; if it is late, the picture holds instead of guessing further.
-    if (next_rel_s > interval - 0.5 / target_hz)
+    // The next tick not shown yet. One that is due right now (e.g. a real
+    // frame arrived just as it was due) is still shown, the wake-up then
+    // comes at once; one that is long over is skipped.
+    const double next_tick = qMax(std::floor(static_cast<double>(now_us - fg_grid_origin_us) / tick_us + 0.5),
+                                  fg_grid_last_tick + 1.0);
+    const double next_us = static_cast<double>(fg_grid_origin_us) + next_tick * tick_us;
+    // Past the newest real frame pictures are predicted up to the limit;
+    // after that nothing changes until the next real frame, which arms the
+    // pacer again. One more tick is allowed to reach the limit itself.
+    const double game_us = next_us - frameGenerationDelaySeconds(interval, target_hz) * 1e6;
+    const double ahead_before = (game_us - tick_us - fg_tl_cur_us) / (interval * 1e6);
+    if (ahead_before > fg_max_prediction.load() - 1e-3)
         return;
-    const double ahead = (next_rel_s - frameGenerationDelaySeconds(interval, target_hz)) / interval;
-    if (ahead > fg_max_prediction.load() + 1e-3)
-        return; // nothing new to show before the next real frame
-    fg_pace_thread->arm(fg_unique_shown_us + static_cast<qint64>(next_tick * tick_us));
+    fg_pace_thread->arm(static_cast<qint64>(std::llround(next_us)));
 }
 
 void QmlMainWindow::requestFrameGenerationRender(qint64 fired_us)
